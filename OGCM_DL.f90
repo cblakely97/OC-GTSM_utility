@@ -52,7 +52,7 @@
       integer :: ierr, myProc, mnProc, nextProc, prevProc
       real*8,parameter :: RhoWat0 = 1d3, PI = 3.141592653589793D0,     &
                        deg2rad = PI/180d0, Rearth = 6378206.4d0,       &
-                       G = 9.80665d0
+                       G = 9.80665d0, rad2deg = 180d0/PI
       real(sz),parameter :: SigT0 = -999d0, DFV = 1d0 !DFV = 1d4 
       ! Netcdf output info
       character(len=40) :: BC2D_Name ! Name of Output File
@@ -61,6 +61,28 @@
               SigTS_id, BPGX_id, BPGY_id, NB_id, lon_id, lat_id, KE_id,&
               latc_id, lats_id, lonc_id, strlen_dim_id, DispX_id, &
               DispY_id
+!     CPB: Variables for outputting on ADCIRC grid. I did my best to
+!     make sure that variable names match what is in ADCIRC source code.
+      CHARACTER(len=40) :: fort14 ! name of fort.14 grid file
+      INTEGER :: NP, NE
+      REAL*8,ALLOCATABLE,DIMENSION(:)   :: SLAM, SFEA, DP
+      REAL*8,PARAMETER :: SFEA0=PI/4d0, SLAM0 = 0d0
+      INTEGER,ALLOCATABLE,DIMENSION(:,:) :: NM, NeiTabEle
+!     CPB: indices for spatial interpolation (use bilinear interpolation
+!     routine from ADCIRC)
+      INTEGER,ALLOCATABLE :: IND(:,:)
+      REAL*8,ALLOCATABLE  :: WEIGHTS(:,:)
+!     Areas of elements and total area connected to each node
+      REAL*8,ALLOCATABLE :: Areas(:), TotalArea(:)
+!     edgelengths for use in calculating derivatives. This is made in
+!     the Calc_Areas subroutine then used in Calc_Derivatives then it is
+!     no longer needed and is deallocated
+      REAL*8,ALLOCATABLE :: FDXE(:,:), FDYE(:,:), SFMXEle(:), SFMYEle(:)
+!     Elemental derivatives of basis functions
+      REAL*8,ALLOCATABLE,DIMENSION(:) :: Dphi1Dx, Dphi2Dx, Dphi3Dx, &
+                                         Dphi1Dy, Dphi2Dy, Dphi3Dy
+!     Area-averaged nodal derivatives
+      REAL*8,ALLOCATABLE,DIMENSION(:) :: BPG_ADCx, BPG_ADCy
 !-----------------------------------------------------------------------
 
 !.......Initialize MPI
@@ -123,6 +145,26 @@
             write(6,*) 'INFO: Compute & output all T and S variables'
          elseif (OutType == 2) then
             write(6,*) 'INFO: Compute & output T, S, U, V'
+         ELSEIF ( OutType.EQ.3 ) THEN
+            ! calculate ALL variables on ADCIRC grid
+            WRITE(6,*) 'INFO: Compute & output T, S, U, V variables ' &
+                       //'on ADCIRC grid'
+            READ(5,'(A40)') fort14; print *, 'fort.14 = ',fort14
+            ! read in fort.14
+            CALL Read_f14()
+            ! Build neighbor table
+            CALL Build_NeiTabEle()
+            ! calculate both Areas and TotalArea
+            CALL Calc_Areas()
+            ! calculate dphi/dx, dphi/dy
+            !call MPI_Finalize(ierr); stop
+            CALL Calc_Derivatives()
+            ALLOCATE( BPG_ADCx(NP) )
+            BPG_ADCx = 0d0
+            CALL DFDxy_nodal( NM, NE, NP, SLAM, Dphi1Dx, Dphi2Dx, &
+                              Dphi3Dx, Areas, TotalArea, BPG_ADCx )
+            CALL Write_Check_Of_Mesh()
+            CALL MPI_Finalize(ierr);stop
          else
             write(6,*) 'ERROR: Invalid OutType = ',OutType
             call MPI_Finalize(ierr); stop
@@ -163,7 +205,7 @@
       do while (EndCheck%total_seconds() >= 0)
          do ii = 1,max(OutType,1)
             ! Download new OGCM NetCDF file
-            call BC3DDOWNLOAD(CurDT,ii,OKflag)
+            call BC3DDOWNLOAD(CurDT,ii,OKflag)            
             if (.not.OKflag) exit
             ! Read the OGCM NetCDF file
             call Read_BC3D_NetCDF(ii)
@@ -369,14 +411,37 @@
       yyyy     = TimeOff%strftime("%Y")
 
       ! GLBv0.08: GOFS 3.1 on lat lon structured grid
-	  ! CPB 1/21/2022: changed to updated GOFS 3.1 grid (GLBy0.08)
+      ! CPB 1/21/2022: changed to updated GOFS 3.1 grid (GLBy0.08)
       ! Get servername
       if (BCServer == 'ftp') then
          ! FTP
-         fileserver = '"ftp://ftp.hycom.org/datasets/GLBy0.08/'
-         !fileserver = '"http://tds.hycom.org/thredds/fileServer/'&
-         !           //'datasets/GLBv0.08/'
-         command    = 'curl ' !'wget '
+         ! As of February 18, 2020 the GLBv0.08 grid was discontinued
+         ! and a new grid was implemented. Therefore we need to check to
+         ! see if that is the case here. 
+         ! NOTE: I have only implemented this update for FTP downloads!
+         ! 
+         ! To simplify the logic just assume we can use the GLBv0.08
+         ! grid and then check if we need to switch to GLBy0.08 below
+         fileserver = '"ftp://ftp.hycom.org/datasets/GLBv0.08/'
+         IF ( TimeOff%getYear().GE.2021 ) THEN
+            ! If we are in 2021 or later we must use GLBy0.08
+            fileserver = '"ftp://ftp.hycom.org/datasets/GLBy0.08/'
+         ELSEIF ( TimeOff%getYear().EQ.2020 ) THEN
+            ! If we are in 2020 we need to check if we are after Feb 19.
+            ! Start by checking if we are in March or later
+            IF ( TimeOff%getMonth().GE.3 ) THEN
+               ! If we are in March or later just use GLBy0.08
+               fileserver = '"ftp://ftp.hycom.org/datasets/GLBy0.08/'
+            ELSEIF (TimeOff%getMonth().EQ.2) THEN
+               ! If we are in February check if we are on or after the
+               ! 19th
+               IF ( TimeOff%getDay().GE.19 ) THEN
+                  ! we need to use GLBy0.08 grid
+                  fileserver = '"ftp://ftp.hycom.org/datasets/GLBy0.08/'
+               ENDIF
+            ENDIF
+         ENDIF
+         command    = 'curl '
          options    = ' -s --connect-timeout 30'
       elseif (BCServer == 'ncs') then
          ! NCSS
@@ -393,6 +458,19 @@
          ! GOFS 3.1 analysis 
          expt = 'expt_93.0'
          filemid = '/hycom_glbv_930_'
+         ! CPB: use same logic above to swap to glby if we are after
+         ! February 19, 2020
+         IF ( TimeOff%getYear().GE.2021 ) THEN
+            filemid = '/hycom_glby_930_'
+         ELSEIF ( TimeOff%getYear().EQ.2020 ) THEN
+            IF (TimeOff%getMonth().GE.3 ) THEN
+               filemid = '/hycom_glby_930_'
+            ELSEIF (TimeOff%getMonth().EQ.2 ) THEN
+               IF ( TimeOff%getDay().GE.19 ) THEN
+                  filemid = '/hycom_glby_930_'
+               ENDIF
+            ENDIF
+         ENDIF
          if (BCServer == 'ftp') then
             expt = trim(expt)//'/data/hindcasts/'//yyyy
          endif
@@ -498,7 +576,7 @@
       ! Get the final path
       Fullpath = trim(fileserver)//trim(expt)//trim(vars)       &
                //trim(filemid)//trim(times)//trim(fileend) 
-      
+      write(6,*) Fullpath 
       ! Let's get expected filesize
       if (BCServer == 'ftp') then
          FSizeTrue = 0; 
@@ -850,7 +928,7 @@
       else
          Fexist = .true.
       endif
-      if (.not.Fexist) then
+      if (.not.Fexist.and.OutType.LT.3) then
          ! Open file  
          call check_err(nf90_create(BC2D_Name, ncformat, ncid))
          ! Define dimensions
@@ -861,9 +939,9 @@
          call check_err(nf90_def_dim(ncid,'NY',NY,NY_dim_id))
          if (OutType.gt.0) &
            call check_err(nf90_def_dim(ncid,'NYY',NY-1,NYY_dim_id))
-		 ! CPB 01/21/2022: changed condition to always define NYYY_dim_id because of netcdf error
-		 ! This should not be an issue since it just results in the latitude for Disp to be written
-		 ! even if it is not used in the adcirc run
+         ! CPB 01/21/2022: changed condition to always define NYYY_dim_id because of netcdf error
+         ! This should not be an issue since it just results in the latitude for Disp to be written
+         ! even if it is not used in the adcirc run
          if (OutType.gt.0) &
            call check_err(nf90_def_dim(ncid,'NYYY',NY-2,NYYY_dim_id))
          ! Define vars 
@@ -1120,6 +1198,504 @@
 !
       end subroutine put_var       
 !-----------------------------------------------------------------------
+!     S U B R O U T I N E  R E A D _ F 1 4
+!-----------------------------------------------------------------------
+!     CPB: reads in lon, lat, depth, and connectivity table from ADCIRC
+!     grid. Does not read in any boundary information.
+!-----------------------------------------------------------------------
+      subroutine Read_F14()
+      implicit none
+      logical :: Fexist
+      INTEGER :: errorio
+      ! looping variables
+      INTEGER :: ii, dmy, dmy2
+!
+      ! open fort.14 file
+      OPEN(14,FILE=trim(fort14),STATUS='OLD',ACTION='READ',&
+      IOSTAT=errorio)
+      IF (errorio.ne.0) THEN
+         write(6,*) 'fort.14 file could not be opened' 
+         call MPI_Abort(MPI_Comm_World,0,ierr)
+      ENDIF
+      READ(14,*)        ! skip First line
+      READ(14,*) NE, NP
+      ! allocate things
+      ALLOCATE(SLAM(NP), SFEA(NP), DP(NP), NM(NE,3))
+      ! read in lat, lon, depth
+      DO ii = 1,NP
+         READ(14,*) dmy, slam(ii), sfea(ii), dp(ii)
+         IF (SLAM(II).LT.0d0) THEN
+            SLAM(II) = SLAM(II) + 360d0
+         ENDIF
+      ENDDO
+      ! read in connectivity table
+      DO ii = 1,NE
+         read(14,*) dmy, dmy2, NM(ii,1), NM(ii,2), NM(ii,3)
+      ENDDO
+      CLOSE(14)
+      WRITE(6,*) 'INFO: Successfully read fort.14 file'
+!
+      end subroutine Read_F14
+!
+!-----------------------------------------------------------------------
+!     S U B R O U T I N E  C A L C _ M E S H _ V A L U E S
+!-----------------------------------------------------------------------
+!     CPB: using SFEA, SLAM, DP, and NM, this subroutine calculates and
+!     returns:
+!        - NeiTabEle(MNP,NEIMAX) 2D array of neighbor elements for each
+!          node
+!-----------------------------------------------------------------------
+      subroutine Build_NeiTabEle()
+      implicit none
+      logical :: Fexist
+      INTEGER :: errorio
+      ! looping variable
+      INTEGER :: ii
+      ! max number of elements attached to a node
+      INTEGER :: MNEI
+      ! counter for finding MNEI
+      INTEGER,ALLOCATABLE,DIMENSION(:) :: NEICOUNT
+      ! nodes 1, 2, 3 for an element
+      INTEGER :: NM1, NM2, NM3
+!
+      ! First loop through the connectivity table to find MNEI
+      ALLOCATE( NEICOUNT(NP) )
+      NEICOUNT = 0
+      DO ii = 1,NE
+         NM1 = NM(ii,1)
+         NM2 = NM(ii,2)
+         NM3 = NM(ii,3)
+         NEICOUNT(NM1) = NEICOUNT(NM1) + 1
+         NEICOUNT(NM2) = NEICOUNT(NM2) + 1
+         NEICOUNT(NM3) = NEICOUNT(NM3) + 1
+      ENDDO
+      MNEI = MAXVAL(NEICOUNT)
+      WRITE(6,*) 'max number of neighbors = ', MNEI
+      ! allocate neitabele now that we know how big it needs to be
+      ALLOCATE( NeiTabEle(NP,MNEI) ) 
+      NeiTabEle = 0
+      NEICOUNT = 0
+      ! now reset neicount to 0 and loop through to populate neitabele
+      DO ii = 1,NE
+         NM1 = NM(ii,1)
+         NM2 = NM(ii,2)
+         NM3 = NM(ii,3)
+         NEICOUNT(NM1) = NEICOUNT(NM1) + 1
+         NEICOUNT(NM2) = NEICOUNT(NM2) + 1
+         NEICOUNT(NM3) = NEICOUNT(NM3) + 1
+         !WRITE(6,*) 'neicount_max = ', maxval(neicount)
+         NeiTabEle(NM1,NEICOUNT(NM1)) = ii
+         NeiTabEle(NM2,NEICOUNT(NM2)) = ii
+         NeiTabEle(NM3,NEICOUNT(NM3)) = ii
+      ENDDO
+      WRITE(6,*) 'INFO: Successfully built neighbor table'
+      DEALLOCATE( NEICOUNT )
+!
+      end subroutine Build_NeiTabEle
+!
+!
+!-----------------------------------------------------------------------
+!-----------------------------------------------------------------------
+      SUBROUTINE Calc_Areas()
+!-----------------------------------------------------------------------
+!     This calculates the areas of each element (Areas) as well as the
+!     total area connected to each node (TotalArea). This is slightly
+!     different than ADCIRC because ADCIRC saves 2*area in Areas
+!-----------------------------------------------------------------------
+!-----------------------------------------------------------------------
+      IMPLICIT NONE
+      ! dummy variables for holding elemental nodes
+      REAL*8,DIMENSION(3) :: LATVE, LONVE, XVE, YVE
+      ! looping variable
+      INTEGER :: ii
+      ! Intermediate variables to make this more readable while building
+      ! areas, etc.
+      REAL*8 :: x1, x2, x3, y1, y2, y3, &
+                x2mx1, x3mx2, x1mx3, &
+                y2my1, y3my2, y1my3
+
+      ! allocate Areas, TotalArea, FDXE, FDYE 
+      ALLOCATE( Areas(NE), TotalArea(NP), FDXE(3,NE), FDYE(3,NE) )
+      TotalArea = 0d0
+      DO ii = 1,NE
+         ! lon/lat in degrees
+         LONVE(1) = SLAM( NM(ii,1) )
+         LONVE(2) = SLAM( NM(ii,2) )
+         LONVE(3) = SLAM( NM(ii,3) )
+         LATVE(1) = SFEA( NM(ii,1) )
+         LATVE(2) = SFEA( NM(ii,2) )
+         LATVE(3) = SFEA( NM(ii,3) )
+         ! get projected coordinates
+         CALL CAL_ELXV_SPCOOR(XVE, YVE, LONVE, LATVE)
+         ! GET X1-X2, ETC
+         x1 = XVE(1)
+         x2 = XVE(2)
+         x3 = XVE(3)
+         y1 = YVE(1)
+         y2 = YVE(2)
+         y3 = YVE(3)
+         ! edgelengths
+         x2mx1 = x2 - x1
+         x3mx2 = x3 - x2
+         x1mx3 = x1 - x3
+         y2my1 = y2 - y1
+         y3my2 = y3 - y2
+         y1my3 = y1 - y3
+         ! store these for later use in calculating derivatives
+         FDXE(1,ii) = -Y3mY2 
+         FDXE(2,ii) = -Y1mY3 
+         FDXE(3,ii) = -Y2mY1 
+         FDYE(1,ii) =  X3mX2 
+         FDYE(2,ii) =  X1mX3 
+         FDYE(3,ii) =  X2mX1 
+         ! store areas
+         AREAS(ii)=abs((X1mX3)*(-Y3mY2)+(X3mX2)*(Y1mY3))
+         ! get totalarea
+         TotalArea(NM(ii,1)) = TotalArea(NM(ii,1)) + Areas(ii)
+         TotalArea(NM(ii,2)) = TotalArea(NM(ii,2)) + Areas(ii)
+         TotalArea(NM(ii,3)) = TotalArea(NM(ii,3)) + Areas(ii)
+      ENDDO
+      WRITE(6,*) 'INFO: successfully calculated areas'
+!
+      END SUBROUTINE Calc_Areas
+!
+!-----------------------------------------------------------------------
+!-----------------------------------------------------------------------
+      SUBROUTINE Calc_Derivatives()
+!-----------------------------------------------------------------------
+!     This calculates the derivatives of the basis functions of each
+!     element
+!-----------------------------------------------------------------------
+!-----------------------------------------------------------------------
+      IMPLICIT NONE
+      ! dummy variables for holding elemental nodes
+      REAL*8,DIMENSION(3) :: LATVE, LONVE, XVE, YVE
+      ! looping variable
+      INTEGER :: ii, NM1, NM2, NM3
+      ! Intermediate variables to make this more readable while building
+      ! areas, etc.
+      REAL*8 :: sfdxfac, sfdyfac, AreaIE2, AreaEle
+      ! allocate memory for derivatives and adjustment factors for
+      ! derivative calculations
+      WRITE(6,*) 'inside Calc_Derivatives'
+      ALLOCATE( Dphi1Dx(NE), Dphi2Dx(NE), Dphi3Dx(NE), &
+                Dphi1Dy(NE), Dphi2Dy(NE), Dphi3Dy(NE) )
+      ! these are used in the calculation of the cylindrical projection
+      ! derivatives and will be deallocated later this subroutine
+      ALLOCATE( SFMXEle(NE), SFMyEle(NE) )
+      ! convert to radians for this
+      SLAM = SLAM*DEG2RAD
+      SFEA = SFEA*DEG2RAD
+      WRITE(6,*) 'about to enter Compute_Cylinproj'
+      CALL COMPUTE_CYLINPROJ_SFAC( SLAM, SFEA )
+      ! back to degrees
+      SLAM = SLAM*RAD2DEG
+      SFEA = SFEA*RAD2DEG
+      ! now that we have adjustment factors calculate derivatives
+      DO ii = 1,NE
+         NM1 = NM(ii,1)
+         NM2 = NM(ii,2)
+         NM3 = NM(ii,3)
+         sfdxfac = SFmxEle(ii)
+         sfdyfac = SFmyEle(ii)
+         AreaEle = Areas(ii)
+         AreaIE2 = 2*AreaEle
+         ! calculate the derivatives
+         Dphi1Dx(ii) = FDXE(1,ii)*sfdxfac/AreaIE2
+         Dphi2Dx(ii) = FDXE(2,ii)*sfdxfac/AreaIE2
+         Dphi3Dx(ii) = FDXE(3,ii)*sfdxfac/AreaIE2
+         Dphi1Dy(ii) = FDYE(1,ii)*sfdyfac/AreaIE2
+         Dphi2Dy(ii) = FDYE(2,ii)*sfdyfac/AreaIE2
+         Dphi3Dy(ii) = FDYE(3,ii)*sfdyfac/AreaIE2
+      ENDDO
+      ! deallocate thngs we don't need anymore
+      DEALLOCATE( SFmxEle, SFmyEle, FDXE, FDYE )
+      WRITE(6,*) 'INFO: Found Dphi_i/Dx_i'
+!
+      END SUBROUTINE Calc_Derivatives
+!
+!-----------------------------------------------------------------------
+!-----------------------------------------------------------------------
+      SUBROUTINE CAL_ELXV_SPCOOR( XVE, YVE, LONVE, LATVE )
+!-----------------------------------------------------------------------
+!     This is pulled directly from the ADCIRC source code with some
+!     modifications
+!    
+!     INPUTS:
+!      - LONVE = 3 longitude values of the nodes of an element in
+!                degrees
+!      - LATVE = 3 latitude values of the nodes of an element in degrees
+!
+!     OUTPUTS:
+!      - XVE = 3 mapped coordinates of the nodes of an element
+!      - YVE = 3 mapped coordinates of the nodes of an element
+!
+!     NOTES: I modified this to always use Mercator rather than have
+!     options since it should be fine for this pre-processor. I also
+!     changed it so that you don't have to swap back and forth between
+!     degrees and radians quite so much.
+!-----------------------------------------------------------------------
+      IMPLICIT NONE
+      REAL*8, DIMENSION(:):: XVE, YVE, LONVE, LATVE
+      
+      !c Local 
+      INTEGER:: II, IDX, SPF
+      REAL*8:: XC, YC
+      REAL*8:: Jac1, Jac2
+      REAL*8, dimension(3):: LONM, LATM, LONTMP
+      REAL*8, dimension(3):: DLX, DL
+      REAL*8 :: DLED1, DLED2
+  
+      LATM(:) = LATVE(1:3)
+      !c Adjust so that 0 <= lon <= 360 
+      LONM(:) = MODULO( LONVE(1:3), 360.0_SZ ) ; 
+      LONTMP = LONM ; 
+      CALL CAL_JAC( Jac1, LONM, LATM )
+      CALL CAL_EDGELENGTH( DLED1, LONM, LATM ) ; 
+   
+      SPF = 0 ; 
+      IF (  Jac1 < 0.0_SZ .OR. &
+          (Jac1 > 0.0_SZ .AND. DLED1 > 360.0_SZ ) ) THEN
+         !c An element has a circular index. 
+         !c Put a wrapped node on the other side
+         !c A wrapped node is on the left of 180
+         IF ( COUNT( LONM > 180.0_SZ ) == 1 ) THEN
+            IDX = sum( merge( (/ 1, 2, 3 /), &
+                (/ 0, 0, 0 /), LONM > 180.0_SZ ) ) ;
+            LONM(IDX) = LONM(IDX) - 360.0_SZ ; 
+         END IF
+         
+         !c A wrapped node is on the right of 180
+         IF ( COUNT( LONM < 180.0_SZ ) == 1 ) THEN
+            IDX = sum( merge( (/ 1, 2, 3 /), &
+                (/ 0, 0, 0 /), LONM < 180.0_SZ ) ) ;
+            
+            LONM(IDX) = LONM(IDX) + 360.0_SZ ; 
+         END IF        
+         CALL CAL_JAC( Jac2, LONM, LATM )
+         CALL CAL_EDGELENGTH( DLED2, LONM, LATM ) ; 
+         SPF = 1 ;
+         IF ( Jac2 < 0.0_SZ .OR. &
+             (Jac1 > 0.0_SZ .AND. DLED2 > DLED1) ) THEN
+            LONM = LONTMP ;  
+            SPF = 0 ; 
+         END IF
+      END IF
+            
+      !c deg -> rad
+      LONM = LONM*DEG2RAD ;
+      LATM = LATM*DEG2RAD ;
+      DO II = 1, 3
+         ! set slam0 and sfea0 to just be 0 and 45 since that is what I
+         ! do in my fort.15
+         CALL CYLINDERMAP(XC, YC, LONM(II), LATM(II), 0d0, 45d0*deg2rad)
+         XVE(II) = XC ;
+         YVE(II) = YC ; 
+      END DO      
+      
+      RETURN ;
+      END SUBROUTINE CAL_ELXV_SPCOOR
+      
+      SUBROUTINE CAL_EDGELENGTH( DEDGE, LON, LAT ) 
+        IMPLICIT NONE
+        REAL*8:: DEDGE, LON(3), LAT(3)
+        !c local c!
+        REAL*8, dimension(3):: DLX, DLY
+        DLX = (/ LON(2) - LON(1), &
+            LON(3) - LON(2), LON(1) - LON(3) /) ; 
+        DLY = (/ LAT(2) - LAT(1), &
+            LAT(3) - LAT(2), LAT(1) - LAT(3) /) ; 
+        
+        DEDGE = SQRT( SUM(DLX*DLX + DLY*DLY) ) ; 
+        RETURN ;
+      END SUBROUTINE CAL_EDGELENGTH
+      SUBROUTINE CAL_JAC( Jac, LON, LAT )
+        IMPLICIT NONE
+        REAL*8:: Jac, LON(3), LAT(3)
+        REAL*8:: XR(2), XS(2)
+        XR = 0.5_SZ*(/ LON(2) - LON(1), LAT(2) - LAT(1) /) ; 
+        XS = 0.5_SZ*(/ LON(3) - LON(1), LAT(3) - LAT(1) /) ; 
+        Jac = (XR(1)*XS(2) - XR(2)*XS(1)) ; ! Find Jacobian
+        RETURN ;
+      END SUBROUTINE CAL_JAC
+!******************************************************************************
+!                                                                             *
+!    Transform from lon,lat (lamda,phi) coordinates into the cylindrical
+!    *
+!    mapping coordinates.
+!    *
+!    Lon,Lat must be in radians.
+!    *
+!
+!    CPB: I pulled this from ADCIRC and modified it to always use
+!    Mercator for this purpose
+!                                                                             *
+!******************************************************************************
+      SUBROUTINE CYLINDERMAP(X,Y,RLAMBDA,PHI,RLAMBDA0,PHI0)
+      IMPLICIT NONE
+      
+      REAL*8 X,Y,RLAMBDA,PHI,RLAMBDA0,PHI0
+     
+      X= Rearth*(RLAMBDA-RLAMBDA0)*COS(PHI0)  ;
+      Y= Rearth*log(tan(PHI) + 1.0d0/cos(PHI))*cos(PHI0) ;          
+      
+      RETURN ;
+      END SUBROUTINE CYLINDERMAP
+!----------------------------------------------------------------------
+!----------------------------------------------------------------------
+      SUBROUTINE COMPUTE_CYLINPROJ_SFAC( SLAMV, SFEAV )
+!----------------------------------------------------------------------
+!----------------------------------------------------------------------
+        IMPLICIT NONE
+! dummy !
+        REAL*8,INTENT(IN),DIMENSION(:) :: SLAMV, SFEAV
+        REAL*8,ALLOCATABLE,DIMENSION(:) :: SFMX, SFMY
+        REAL*8 :: SFCT, SFCX, SFCY, TANPHI, YCSFAC
+       
+        ! local !
+        INTEGER :: I, MEXP
+        REAL*8 :: RFAC1, RFAC2, RFAC3
+
+!.... Set:
+!.... SFCT, SFCX, SFCY, SFMX, SFMY, YCSFAC
+      ALLOCATE( SFMX(NP), SFMY(NP) )
+!.... accordingly in order to determine the forms of equations to be
+!solved
+!     
+!.....DEFAULT:
+
+           MEXP = MOD(22,20) ; ! = 2 if mercator
+!......ICS = 20 : Equal area projection
+!......    = 21 : CPP
+!.....     = 22 : Mercartor
+!......from WP
+           WRITE(6,*) 'about to enter loop'
+           DO I = 1, NP
+              SFCT = cos(SFEAV(I))**MEXP ;           
+              SFCX = cos(SFEA0)*( cos(SFEAV(I))**(MEXP - 1) ) ;
+              SFCY = cos(SFEA0)**(MEXP - 1) ; 
+            
+              SFMX(I) = cos(SFEA0)/COS(SFEAV(I)) ;
+              SFMY(I) = SFMX(I)**(MEXP - 1) ;
+              TANPHI = (TAN(SFEAV(I))/Rearth) ;
+              YCSFAC = cos( SFEAV(I) ) ; 
+           END DO
+           WRITE(6,*) 'done with loop'
+        
+!     COMPUTE ELEMENT AVERAGE FROM NODAL VECTORS ADJUSTING EQUATIONS
+!     TO CYLINDER COORDINATES
+        CALL SFAC_ELEAVG( SFMXEle, SFMX, NM, NE ) ; 
+        CALL SFAC_ELEAVG( SFMYEle, SFMY, NM, NE ) ;         
+       WRITE(6,*) 'leaving compute_cylinproj_sfac'  
+       DEALLOCATE( SFMY, SFMX )
+!      Only need the  averages of these... 
+        
+        RETURN ; 
+!----------------------------------------------------------------------
+      END SUBROUTINE COMPUTE_CYLINPROJ_SFAC
+!----------------------------------------------------------------------
+!----------------------------------------------------------------------
+      SUBROUTINE SFAC_ELEAVG( SFAELES, SFNODES, NM, NE ) 
+!----------------------------------------------------------------------
+!----------------------------------------------------------------------
+      IMPLICIT NONE
+      INTEGER :: NM(:,:), NE
+      REAL*8, dimension(:),INTENT(IN) :: SFNODES
+      REAL*8,DIMENSION(:),INTENT(INOUT) :: SFAELES
+      
+      ! local
+      INTEGER:: IE, NMI1, NMI2, NMI3
+      REAL*8 :: ONETRD 
+      
+      ONETRD = 1d0/3d0 ;
+      DO IE = 1, NE
+         NMI1 = NM(IE,1) ; 
+         NMI2 = NM(IE,2) ; 
+         NMI3 = NM(IE,3) ;  
+         SFAELES(IE) = (SFNODES(NMI1) + &
+         SFNODES(NMI2) + SFNODES(NMI3))*ONETRD ; 
+      END DO
+      
+      RETURN ;
+!----------------------------------------------------------------------
+      END SUBROUTINE SFAC_ELEAVG 
+!----------------------------------------------------------------------
+!----------------------------------------------------------------------
+      SUBROUTINE Write_Check_Of_Mesh()
+      IMPLICIT NONE
+      integer :: ii
+      OPEN(15,FILE='check_dphi2dx.14',STATUS='replace', &
+          access='sequential',&
+          action='write')
+      write(15,*) 'test'
+      write(15,*) NE, NP
+      do ii = 1,NP
+         WRITE(15,1000) ii, slam(ii), sfea(ii), BPG_ADCx(ii)
+      end do
+      do ii = 1,NE
+         WRITE(15,*) ii, '3', NM(ii,1), nm(ii,2), nm(ii,3)
+      end do
+ 1000 FORMAT(I8,3(E20.12))
+      write(15,*) '0'
+      write(15,*) '0'
+      write(15,*) '0'
+      write(15,*) '0'
+      write(15,*) '0'
+      CLOSE(15)
+      END SUBROUTINE write_check_of_mesh
+!-----------------------------------------------------------------------
+!----------------------------------------------------------------------
+      SUBROUTINE DfDxy_nodal(ConnTable, NumEle, NumNodes, Fv, Dphi1, &
+                             Dphi2, Dphi3, EleAreas, Tot_Area, DFDxy)
+!----------------------------------------------------------------------
+!     This subroutine calculates:
+!        DF_j/Dx = \SUM_{i=1}^3 ( F_i Dphi_i )
+!     Inputs:
+!        - ConnTable = connectivity table of mesh
+!        - NumEle    = number of elements in mesh
+!        - NumNodes  = number of nodes in mesh
+!        - Fv        = functional values at nodes in mesh (size 1xNp)
+!        - Dphii     = ai/2Aj OR bi/2Aj depending on if this is a
+!                    y-derivative or x-derivative. i denotes node
+!                    number, j denotes element. 
+!        - EleAreas  = areas of all elements (size 1xNumEle)
+!        
+!     Outputs:
+!        - DfDxy     = area averaged derivatives of F_i on a nodal basis.
+!                    = (1/TotalArea_i)*\SUM_{j=1}^{NumNei} ( A_j DF_j/dx )
+!----------------------------------------------------------------------
+      IMPLICIT NONE
+      ! inputs
+      INTEGER,INTENT(IN),DIMENSION(:,:) :: ConnTable
+      INTEGER,INTENT(IN) :: NumEle, NumNodes
+      REAL*8,INTENT(IN),DIMENSION(:) :: Fv, Dphi1, Dphi2, Dphi3, &
+                                        EleAreas, Tot_Area
+      ! outputs
+      REAL*8,INTENT(INOUT),DIMENSION(:) :: DFDxy
+      ! local
+      integer :: ii, NM1, NM2, NM3
+      REAL*8  :: DFDxy_ele      
+      ! loop through elements and find elemental derivative. Then area
+      ! weight and put on the nodes of the element
+      write(6,*) 'inside dfdx calculation'
+      DO ii = 1,NumEle
+         NM1 = ConnTable(ii,1)
+         NM2 = ConnTable(ii,2)
+         NM3 = ConnTable(ii,3)
+         DFDxy_ele = Dphi1(ii)*Fv(NM1) + &
+                     Dphi2(ii)*FV(NM2) + &
+                     Dphi3(ii)*FV(NM3)
+         DFDxy(NM1) = DFDxy(NM1) + DFDxy_ele*EleAreas(ii)
+         DFDxy(NM2) = DFDxy(NM2) + DFDxy_ele*EleAreas(ii)
+         DFDxy(NM3) = DFDxy(NM3) + DFDxy_ele*EleAreas(ii)
+      ENDDO
+      ! divide by total area
+      DO ii = 1,NumNodes
+         DFDxy(ii) = DFDxy(ii)/Tot_Area(ii)
+      ENDDO
+
+      END SUBROUTINE DfDxy_nodal
+!----------------------------------------------------------------------
 !-----------------------------------------------------------------------
       END PROGRAM OGCM_DL
 !-----------------------------------------------------------------------
