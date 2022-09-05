@@ -70,7 +70,7 @@
       INTEGER,ALLOCATABLE,DIMENSION(:,:) :: NM, NeiTabEle
 !     CPB: indices for spatial interpolation (use bilinear interpolation
 !     routine from ADCIRC)
-      INTEGER,ALLOCATABLE :: IND(:,:)
+      INTEGER,ALLOCATABLE :: INDXY(:,:), INDZ(:)
       REAL*8,ALLOCATABLE  :: WEIGHTS(:,:)
 !     Areas of elements and total area connected to each node
       REAL*8,ALLOCATABLE :: Areas(:), TotalArea(:)
@@ -208,7 +208,7 @@
             ! Read the OGCM NetCDF file
             call Read_BC3D_NetCDF(ii)
             ! Calculate the new BC2D terms.
-            !call Calc_BC2D_Terms(ii)
+            call Calc_BC2D_Terms(ii)
          end do
          ! Put new BC2D terms in netCDF output file
          !call UpdateNetCDF(IT,OKflag)
@@ -276,7 +276,6 @@
       ! and we switch grids it aborts the program and writes an error
       ! message. If we are using the ADCIRC grid then it will recompute
       ! the interpolants and continue outputting.
-      WRITE(6,*) 'INFO: inside Get_LonLatWhatever FirstCall = ',FirstCall
       IF (.NOT.FirstCall) THEN
          call Check_err(NF90_INQ_DIMID(NC_ID,'lat',Temp_ID))
          Call Check_err(NF90_INQUIRE_DIMENSION(NC_ID,Temp_ID,&
@@ -1741,6 +1740,183 @@
 
       END SUBROUTINE DfDxy_nodal
 !----------------------------------------------------------------------
+!----------------------------------------------------------------------
+      SUBROUTINE Get_Interpolation_Weights()
+!----------------------------------------------------------------------
+!     This subroutine finds the interpolation weights and indices to 
+!     linearly interpolate between the GOFS3.1 grid and ADCIRC grid. It
+!     uses the mesh info (SLAM, SFEA, NP, DP) and populates the indices
+!     (indxy, indz) based on the GOFS information (BC3D_Lon, BC3D_Lat,
+!     and BC3D_Z). To determine the xy information it uses bl_interp
+!     from ADCIRC.
+!----------------------------------------------------------------------
+      IMPLICIT NONE
+      ! logical for first call
+      LOGICAL,SAVE :: FirstCall=.TRUE.
+      ! looping variable
+      INTEGER :: ii, iz
+      ! lon, lat, and depth of node
+      REAL*8 :: xx, yy, bb
+      ! indices and weights for each loop iteration
+      INTEGER :: indt(4)
+      REAL*8 :: wt(4)
+      ! allocate on first call
+      IF (FirstCall) THEN
+         FirstCall = .FALSE.
+         ALLOCATE( INDXY(4,NP), WEIGHTS(4,NP), INDZ(NP) )
+      ENDIF
+      ! lets get those indices
+      DO ii = 1,NP
+         xx = SLAM(ii)
+         yy = SFEA(ii)
+         bb = DP(ii)
+         ! xy first
+         CALL bl_interp(NX,BC3D_Lon,NY,BC3D_Lat,xx,yy,indt,wt)
+         INDXY(:,ii)   = indt
+         WEIGHTS(:,ii) = wt
+         ! z next
+         DO iz = 1,NZ
+            IF (BC3D_Z(iz).LT.bb) INDZ(ii) = iz
+         ENDDO
+      ENDDO
+      END SUBROUTINE Get_Interpolation_Weights
+!----------------------------------------------------------------------
+!----------------------------------------------------------------------
+      SUBROUTINE bl_interp(xp, x_array, yp, y_array, x, y, ii, w)
+      ! This function uses bilinear interpolation to get the
+      ! interpolation weights, w and the indices for interpolation
+      ! Assumed to be sampled on a regular grid, with the grid x
+      ! values
+      ! specified by x_array and the grid y values specified by
+      ! y_array
+      implicit none
+      integer, intent(in) :: xp, yp           
+      real*8, dimension(xp), intent(in) :: x_array
+      real*8, dimension(yp), intent(in) :: y_array
+      real*8, intent(in) :: x,y
+      real*8, intent(out) :: w(4)
+      integer, intent(out) :: ii(4)
+      real*8 :: denom, x1, x2, y1, y2
+      real*8 :: x2x1, y2y1, x2x, y2y, xx1, yy1
+      integer  :: i, j, ir, jr
+      i = binarysearch(xp, x_array, x)
+      j = binarysearch(yp, y_array, y)
+      ! Make sure we start from one
+      if (i.eq.0) then
+         i = 1; ir = 1
+      else
+         ir = i + 1
+         if (ir > xp) then
+            if (3d0*x_array(1) - 2d0*x_array(2) + &
+               360d0 < x_array(xp)) then
+               ! Wrap the longitude around
+               ir = 1
+            else
+               ir = xp
+            endif
+         endif
+      endif
+      x1 = x_array(i)
+      x2 = x_array(ir)
+          
+      if (j.eq.0) then
+         j = 1; jr = 1
+      else
+         jr = j + 1
+         if (jr > yp) jr = yp
+      endif
+      y1 = y_array(j)
+      y2 = y_array(jr)
+      ! Lon, lat to meters 
+      if (ir.eq.i) then
+         x2x1 = 1.0d0
+         x2x  = 0.0d0
+         xx1  = 1.0d0
+      else
+         x2x1 = haversine(x1,x2,y,y)
+         x2x  = haversine(x,x2,y,y)
+         xx1  = haversine(x1,x,y,y)
+      endif
+      if (jr.eq.j) then
+         y2y1 = 1.0d0
+         y2y  = 0.0d0
+         yy1  = 1.0d0
+      else
+         y2y1 = haversine(x,x,y1,y2)
+         y2y  = haversine(x,x,y,y2)
+         yy1  = haversine(x,x,y1,y)
+      endif 
+      denom = x2x1*y2y1
+         
+      if (denom < 1e-12) then
+         write(16,*) 'Denominator is small',denom
+         write(16,*) x,y,x1,y1,x2,y2,i,j,ir,jr
+      endif
+        
+      ! Output the indices
+      ii   = [i, j, ir, jr]
+      ! Output the weights
+      w(1) = x2x*y2y/denom
+      w(2) = xx1*y2y/denom
+      w(3) = x2x*yy1/denom
+      w(4) = xx1*yy1/denom
+      END SUBROUTINE bl_interp
+!----------------------------------------------------------------------
+!-----------------------------------------------------------------------
+      FUNCTION binarysearch(length, array, value, delta) 
+          ! Given an array and a value, returns the index of the element
+          ! that
+          ! is closest to, but less than, the given value.
+          ! Uses a binary search algorithm.
+          ! "delta" is the tolerance used to determine if two values are
+          ! equal
+          ! if ( abs(x1 - x2) <= delta) then
+          !    assume x1 = x2
+          ! endif
+          implicit none
+          integer, intent(in) :: length
+          real*8, dimension(length), intent(in) :: array
+          !f2py depend(length) array
+          real*8, intent(in) :: value
+          real*8, intent(in), optional :: delta
+          integer :: binarysearch
+          integer :: left, middle, right, orientation
+          real*8 :: d
+          if (present(delta) .eqv. .true.) then
+             d = delta
+          else
+             d = 1d-9
+          endif
+          orientation = 1
+          if (array(2) < array(1)) orientation = -1
+       
+          left = 1
+          right = length
+          do
+             if (left > right) exit
+             middle = nint((left+right) / 2.0d0)
+             if ( abs(array(middle) - value) <= d) then
+                binarySearch = middle
+                return
+             endif
+             select case(orientation)
+             case(1) 
+                if (array(middle) > value) then
+                   right = middle - 1
+                else
+                   left = middle + 1
+                end if
+             case(-1)
+                if (array(middle) < value) then
+                   right = middle - 1
+                else
+                   left = middle + 1
+                end if
+             end select
+          end do
+          binarysearch = right
+      END FUNCTION binarysearch
+!-----------------------------------------------------------------------
 !-----------------------------------------------------------------------
       END PROGRAM OGCM_DL
 !-----------------------------------------------------------------------
