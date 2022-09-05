@@ -157,14 +157,12 @@
             ! calculate both Areas and TotalArea
             CALL Calc_Areas()
             ! calculate dphi/dx, dphi/dy
-            !call MPI_Finalize(ierr); stop
             CALL Calc_Derivatives()
             ALLOCATE( BPG_ADCx(NP) )
             BPG_ADCx = 0d0
             CALL DFDxy_nodal( NM, NE, NP, SLAM, Dphi1Dx, Dphi2Dx, &
                               Dphi3Dx, Areas, TotalArea, BPG_ADCx )
-            CALL Write_Check_Of_Mesh()
-            CALL MPI_Finalize(ierr);stop
+            !CALL Write_Check_Of_Mesh()
          else
             write(6,*) 'ERROR: Invalid OutType = ',OutType
             call MPI_Finalize(ierr); stop
@@ -210,10 +208,10 @@
             ! Read the OGCM NetCDF file
             call Read_BC3D_NetCDF(ii)
             ! Calculate the new BC2D terms.
-            call Calc_BC2D_Terms(ii)
+            !call Calc_BC2D_Terms(ii)
          end do
          ! Put new BC2D terms in netCDF output file
-         call UpdateNetCDF(IT,OKflag)
+         !call UpdateNetCDF(IT,OKflag)
          ! Update the time 
          CurDT = CurDT + timedelta(hours=mnProc*BC3D_DT*TMULT)
          EndCheck = TEDT - CurDT
@@ -267,12 +265,42 @@
       integer,intent(in) :: NC_ID
       integer  :: Temp_ID, i, j, ii 
       real*8   :: BC3D_Lon_s, LatVal 
+      LOGICAL,SAVE :: FirstCall = .TRUE.
+      INTEGER :: NY_temp ! to see if we swapped grids
         
-      if (allocated(BC3D_Lon)) then
-         ! Test the latitude, longitude and z variables 
+      ! if this is not the first call, check to see if we have crossed
+      ! over the time period from the GLBv0.08 grid to the GLBy0.08
+      ! grid. The way I will check this is if NY has changed (since only
+      ! resolution in the latitudinal direction changed). I am also gonna
+      ! code it such that if it is trying to output on the HYCOM grid
+      ! and we switch grids it aborts the program and writes an error
+      ! message. If we are using the ADCIRC grid then it will recompute
+      ! the interpolants and continue outputting.
+      WRITE(6,*) 'INFO: inside Get_LonLatWhatever FirstCall = ',FirstCall
+      IF (.NOT.FirstCall) THEN
+         call Check_err(NF90_INQ_DIMID(NC_ID,'lat',Temp_ID))
+         Call Check_err(NF90_INQUIRE_DIMENSION(NC_ID,Temp_ID,&
+                        len=NY_temp))
+         IF (NY_temp.NE.NY.AND.OutType.LT.3) THEN
+            WRITE(6,*) 'ERROR: This time period contains the switch'&
+                        //'from GLBv0.08 to GLBy0.08 grids.'
+            WRITE(6,*) '       Currently there is no support for'&
+                          //' OutType 1 or 2 for this swap.'
+            CALL MPI_Finalize(ierr);stop
+         ELSEIF (NY_temp.NE.NY) THEN
+            ! deallocate all values we get from the input data
+            DEALLOCATE( BC3D_Lat, BC3D_Lon, BC3D_Z, BC3D_SP, BC3D_T )
+            FirstCall = .True.
+         ENDIF
+         ! test if we are still in the same lon coordinates (-180/180
+         ! or 0/360)
          call Check_err(NF90_INQ_VARID(NC_ID,'lon',Temp_ID))
          call Check_err(NF90_GET_VAR(NC_ID,Temp_ID,BC3D_Lon))
-      else
+      ENDIF
+      ! if this is the first call or we swap grids define all the
+      ! various arrays and sizes we need
+      IF (FirstCall) THEN
+         FirstCall = .FALSE.
          ! First call
          call Check_err(NF90_INQ_DIMID(NC_ID,'lat',Temp_ID))
          call Check_err(NF90_INQUIRE_DIMENSION(NC_ID,Temp_ID,len=NY))
@@ -280,13 +308,17 @@
          call Check_err(NF90_INQUIRE_DIMENSION(NC_ID,Temp_ID,len=NX))
          call Check_err(NF90_INQ_DIMID(NC_ID,'depth',Temp_ID))
          call Check_err(NF90_INQUIRE_DIMENSION(NC_ID,Temp_ID,len=NZ))
-         
+          
          ! Allocate the lat lon and z arrays first 
          allocate(BC3D_Lat(NY),BC3D_Lon(NX),BC3D_Z(NZ))
          allocate(BC3D_SP(NX,NY,NZ),BC3D_T(NX,NY,NZ),BC3D_BCP(NX,NY,NZ))
-         allocate(BC2D_NB(NX,NY),BC2D_NM(NX,NY),&
-                  BC2D_SigTS(NX,NY),BC2D_MLD(NX,NY))
-         allocate(BC2D_BX(NX,NY),BC2D_BY(NX,NY-1),DX(NX,NY),DY(NX,NY-1))
+         ! only need to allocate BC2D variables if OutType < 3
+         IF (OutType.LT.3) THEN
+            allocate(BC2D_NB(NX,NY),BC2D_NM(NX,NY),&
+                     BC2D_SigTS(NX,NY),BC2D_MLD(NX,NY))
+            allocate(BC2D_BX(NX,NY),BC2D_BY(NX,NY-1),DX(NX,NY),&
+                     DY(NX,NY-1))
+         ENDIF
          if (OutType.eq.2) then
             allocate(BC2D_CD(NX,NY-2),BC2D_DispX(NX,NY-2),&
                      BC2D_DispY(NX,NY-2))
@@ -302,20 +334,33 @@
          call Check_err(NF90_INQ_VARID(NC_ID,'depth',Temp_ID))
          call Check_err(NF90_GET_VAR(NC_ID,Temp_ID,BC3D_Z, &
                         start=[1],count=[NZ]))
+         IF (OutType.LT.3) THEN
          ! Pre-computing the distances on the sphere
-         do j = 1,NY 
-            do i = 1,NX
-               LatVal  = min(LatUL,BC3D_Lat(j))
-               ii = i + 1
-               if (i.eq.NX) ii = 1
-               DX(i,j) = haversine(BC3D_Lon(i),BC3D_Lon(ii),   &
-                                   LatVal,LatVal) 
-               if (j < NY) then
-                  DY(i,j) = haversine(BC3D_Lon(i),BC3D_Lon(i), &
-                                      BC3D_Lat(j),BC3D_Lat(j+1)) 
-               endif 
+            do j = 1,NY 
+               do i = 1,NX
+                  LatVal  = min(LatUL,BC3D_Lat(j))
+                  ii = i + 1
+                  if (i.eq.NX) ii = 1
+                  DX(i,j) = haversine(BC3D_Lon(i),BC3D_Lon(ii),   &
+                                      LatVal,LatVal) 
+                  if (j < NY) then
+                     DY(i,j) = haversine(BC3D_Lon(i),BC3D_Lon(i), &
+                                         BC3D_Lat(j),BC3D_Lat(j+1)) 
+                  endif 
+               enddo
             enddo
-         enddo
+         ENDIF
+         ! If we are outputting to ADCIRC grid just put this all in
+         ! 0-360 coordinates 
+         IF (OutType.EQ.3) THEN
+            DO i = 1,NY
+               IF (BC3D_Lon(i).lt.0d0) THEN
+                  BC3D_Lon(i) = BC3D_Lon(i) + 360d0
+               ENDIF
+            ENDDO
+            ! get weights and indices for linear interpolation
+            !CALL Get_Interpolation_Weights()
+         ENDIF
       endif
       BC3D_Lon_s = BC3D_Lon(1)
       if (BC3D_Lon_s < 0d0) then
@@ -331,6 +376,7 @@
          !write(6,*) 'Lon of ',trim(BC3D_Name),&
          !           ' is defined from 0 to 360, is = ',is
       endif
+      
       
       end subroutine Get_LonLatDepthTime
 !-----------------------------------------------------------------------
@@ -576,7 +622,6 @@
       ! Get the final path
       Fullpath = trim(fileserver)//trim(expt)//trim(vars)       &
                //trim(filemid)//trim(times)//trim(fileend) 
-      write(6,*) Fullpath 
       ! Let's get expected filesize
       if (BCServer == 'ftp') then
          FSizeTrue = 0; 
