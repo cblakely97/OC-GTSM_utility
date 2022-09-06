@@ -251,6 +251,12 @@
           BC3D_SP = read_nc_var(NC_ID,'water_u   ',1)
           ! North-South Velocity
           BC3D_T  = read_nc_var(NC_ID,'water_v   ',1)
+        CASE(3)
+          write(6,*) myProc,'Processing T & S (ADCIRC grid)'
+          ! Practical Salinity
+          BC3D_SP = read_nc_var(NC_ID,'salinity  ',1)
+          ! Temperature 
+          BC3D_T  = read_nc_var(NC_ID,'water_temp',1)
       end select
 
       ! Close NETCDF
@@ -324,6 +330,9 @@
             allocate(DUU(NX,NY), DVV(NX,NY), BC2D_KE(NX,NY),&
                      DUV(NX,NY), DU(NX,NY), DV(NX,NY), B(NX,NY))
          endif
+         ! If OutType = 3 allocate ADCIRC grid size values
+         IF (OutType.EQ.3) THEN
+            ALLOCATE(  )
 
          ! Read the latitude, longitude and z variables 
          call Check_err(NF90_INQ_VARID(NC_ID,'lat',Temp_ID))
@@ -937,9 +946,220 @@
       enddo
 !!$omp end do
 !!$omp end parallel
+      CASE(3)
+      ! CPB: calculate values on the ADCIRC mesh
+      CALL Calc_BC2D_ADCIRC()
       end select
 !-----------------------------------------------------------------------
       end subroutine Calc_BC2D_Terms
+!-----------------------------------------------------------------------
+!-----------------------------------------------------------------------
+!     S U B R O U T I N E  C A L C _ B C 2 D _ A D C I R C
+!-----------------------------------------------------------------------
+!     This subroutine takes the salinity and temperature read from GOFS
+!     data and:
+!        1) Converts from practical salinity to absolute salinity and
+!           from temperature to conservative temperature on the GOFS
+!           grid.
+!        2) Loops through every ADCIRC node and for every depth in 
+!           BC3D_Z less than the node depth. At each Z-level
+!           interpolates the conservative temp and absolute salinity to
+!           the grid point and calculates a baroclinic pressure.
+!        3) Once the baroclinic pressures (BC3D_BCP) are calculated,
+!           loop through once more to calculate the baroclinic pressure
+!           gradients at each depth FOR EACH ELEMENT. We then integrate
+!           over the depth and depth average using the shallowest depth
+!           from the element (BC2D_BPGXe. 
+!-----------------------------------------------------------------------
+      SUBROUTINE Calc_BC2D_ADCIRC()
+      IMPLICIT NONE
+      REAL*8 :: RHO, RHOAVG, BX_AVG, BY_AVG, BX_Z, BY_Z, DZ
+      REAL*8 :: UAVG, VAVG, DUUX, DVVY, DUVX, DUVY, VEL, CD, CDX, CDY 
+      REAL*8 :: SA(NZ), CT(NZ), LAT(NZ), N2(NZ-1), ZMID(NZ-1),&
+                BCP_ADC(NZ,NP)
+      INTEGER  :: I, J, K, II, KB, KBX, KBY, IP, IM
+      REAL(SZ) :: FV = -3D4, FVP = -3D4 + 1D-3, VS = 1D-3 
+      ! define fill values
+      real(sz) :: FV = -3d4, FVP = -3d4 + 1d-3, Vs = 1d-3
+      ! persistent logical for if we are on the first call
+      LOGICAL,SAVE :: FirstCall = .TRUE.
+      ! allocate output arrays if on the first call
+      IF (FirstCall) THEN
+         ALLOCATE( BPG_ADCx(NP), BPG_ADCy(NP), SigTS_ADC(NP),&
+                   NB_ADC(NP), NM_ADC(NP) ) 
+         FirstCall = .FALSE.
+      ENDIF
+      ! reset all values to 0
+      BPG_ADCx  = 0d0
+      BPG_ADCy  = 0d0
+      BCP_ADC   = 0d0
+      SigTS_ADC = 0d0
+      NB_ADC    = 0d0
+      NM_ADC    = 0d0
+      !
+      ! get BCP_ADC, SigTS_ADC, NB_ADC, and NM_ADC
+      !
+      DO IP = 1,NP
+         ! save lat and lon as yy,xx for readability
+         xx = SLAM(IP)
+         yy = SFEA(IP)
+         ! get max depth we are using
+         idzmax = INDZ(IP)
+         ! if we are only at the surface skip this whole loop
+         IF (idzmax.lt.2) CYCLE
+         ! reset the variable to track if we are at the bottom to 0
+         truebottom = 0
+         ! for my sanity reset the arrays for SA and CT to 0
+         SA = 0d0
+         CT = 0d0
+         ! we also need a latitude array for the buoyancy frequency profile
+         ! calculations
+         Lat = yy
+         DO iz = 1,idzmax
+            ! for readability save the salinity and temps as individual values
+            ! rather than using the indices
+            ! salinity
+            sp1 = BC3D_SP(INDXY(1,IP),INDXY(2,IP),iz)
+            sp2 = BC3D_SP(INDXY(3,IP),INDXY(2,IP),iz)
+            sp3 = BC3D_SP(INDXY(1,IP),INDXY(4,IP),iz)
+            sp4 = BC3D_SP(INDXY(3,IP),INDXY(4,IP),iz)
+            ! temperature
+            t1  = BC3D_T(INDXY(1,IP),INDXY(2,IP),iz)
+            t2  = BC3D_T(INDXY(3,IP),INDXY(2,IP),iz)
+            t3  = BC3D_T(INDXY(1,IP),INDXY(4,IP),iz)
+            t4  = BC3D_T(INDXY(3,IP),INDXY(4,IP),iz)
+            ! if any of these are a fill value then we have hit the bottom and
+            ! should use a fill value
+            IF (sp1.lt.FVP .OR. sp2.lt.FVP .OR.&
+                sp3.lt.FVP .OR. sp4.lt.FVP .OR.&
+                t1.lt.FVP  .OR. t2.lt.FVP .OR.&
+                t3.lt.FVP  .OR. t4.lt.FVP .OR.) THEN
+               BCP_ADC(iz,IP) = FV
+            ELSE
+               ! convert to absolute salinity
+               sa1 = gsw_SA_from_SP(max(2d0,sp1),BC3D_Z(iz),xx,yy)
+               sa2 = gsw_SA_from_SP(max(2d0,sp2),BC3D_Z(iz),xx,yy)
+               sa3 = gsw_SA_from_SP(max(2d0,sp3),BC3D_Z(iz),xx,yy)
+               sa4 = gsw_SA_from_SP(max(2d0,sp4),BC3D_Z(iz),xx,yy)
+               ! convert to conservative temperature
+               ct1 = gsw_CT_from_T(sa1,dble(t1),BC3D_Z(iz))
+               ct2 = gsw_CT_from_T(sa2,dble(t2),BC3D_Z(iz))
+               ct3 = gsw_CT_from_T(sa3,dble(t3),BC3D_Z(iz))
+               ct4 = gsw_CT_from_T(sa4,dble(t4),BC3D_Z(iz))
+               ! interpolate to our ADCIRC node
+               SA(iz) = sa1*WEIGHTS(1,IP) + sa2*WEIGHTS(2,IP) +&
+                        sa3*WEIGHTS(3,IP) + sa4*WEIGHTS(4,IP)
+               CT(iz) = ct1*WEIGHTS(1,IP) + ct2*WEIGHTS(2,IP) +&
+                        ct3*WEIGHTS(3,IP) + ct4*WEIGHTS(4,IP)
+               ! if we are below the surface put rho from the last depth into
+               ! rhoavg for trapezoidal rule later
+               IF (iz.gt.1) rhoavg = rho
+               ! get our new rho for this depth
+               rho = gsw_rho(SA(iz),CT(iz),BC3D_Z(iz))
+               ! if we are below the surface get baroclinic pressure,
+               ! otherwise get surface values
+               IF (iz.gt.1) THEN
+                  rhoavg = 0.5d0*(rhoavg+rho)
+                  dz = BC3D_Z(iz) - BC3D_Z(iz-1)
+                  BCP_ADC(iz,IP) = BCP_ADC(iz-1,IP) +&
+                                   dz*(rhoavg - RhoWat0)
+               ELSE
+                  SigTS_ADC(IP) = rho-RhoWat0
+               ENDIF
+               truebottom = iz
+            ENDIF
+         ENDDO
+         ! if applicable get the buoyancy frequencies
+         IF (truebottom.GT.1) THEN
+            CALL gsw_Nsquared(SA(1:truebottom),CT(1:truebottom),&
+                              BC3D_Z(1:truebottom),Lat(1:truebottom),&
+                              N2(1:truebottom-1),zmid(1:truebottom-1))
+            NB_ADC = SQRT(MAX(0d0,N2(truebottom-1)))
+            ! integrate to get depth-averaged value. Since gsw_Nsquared
+            ! returns the value at the midpoint I will assume that is
+            ! the average in that z-level
+            DO iz = 1,truebottom-1
+               dz = BC3D_Z(iz+1)-BC3D_Z(iz)
+               NM_ADC(IP) = NM_ADC(IP) + dz*sqrt(max(0d0,N2(iz)))
+            ENDDO
+            NM_ADC(IP) = NM_ADC(IP)/BC3D_Z(truebottom)
+            ! Get Mixed-layer depth in case I decide I need it
+            MLD_ADC(IP) = min(DFV,&
+                             gsw_mlp(SA(1:truebottom),CT(1:truebottom),&
+                                  BC3D_Z(1:truebottom),&
+                                  BC3D_z(truebottom))
+         ENDIF
+      ENDDO
+      !
+      ! Calculate baroclinic pressure gradients
+      !
+      DO IE = 1,NE
+         NM1 = NM(IE,1)
+         NM2 = NM(IE,2)
+         NM3 = NM(IE,3)
+         ddx1 = Dphi1Dx(IE)
+         ddx2 = Dphi2Dx(IE)
+         ddx3 = Dphi3Dx(IE)
+         ddy1 = Dphi1Dy(IE)
+         ddy2 = Dphi2Dy(IE)
+         ddy3 = Dphi3Dy(IE)
+         ! Only go down to the largest GOFS depth that is less than the ADCIRC
+         ! depth
+         idzmax = min(INDZ(NM1), INDZ(NM2), INDZ(NM3))-1
+         ! reset bpgx and bpgy to 0
+         bpgx = 0d0
+         bpgy = 0d0
+         ! only calculate if we are deep enough
+         IF (idzmax.gt.0) THEN
+            DO iz = 1,idzmax
+               bcp1 = BCP_ADC(iz+1,NM1)
+               bcp2 = BCP_ADC(iz+1,NM2)
+               bcp3 = BCP_ADC(iz+1,NM3)
+               ! if we hit a fill value then stop this loop and fix the
+               ! last value we added to the sum by subtracting off half
+               ! of it
+               IF (bcp1.lt.FVP.OR.bcp2.lt.FVP.OR.bcp3.lt.FVP) then
+                  bpgx = bpgx - 0.5d0*bx*dz
+                  bpgy = bpgy - 0.5d0*by*dz
+                  idzmax = iz-1
+                  EXIT
+               ENDIF
+               dz = BC3D_Z(iz+1)-BC3D_Z(iz)
+               ! for ease of readability put bpg at this depth in variables
+               ! called
+               ! bx and by before adding them to the total sum
+               bx = bcp1*ddx1 + bcp2*ddx2 + bcp3*ddx3
+               by = bcp1*ddy1 + bcp2*ddy2 + bcp3*ddy3
+               ! factor for trapezoidal rule
+               facval = 1d0
+               IF (iz.eq.idzmax) facval = 0.5d0 
+               bpgx = bpgx + facval*bx*dz
+               bpgy = bpgy + facval*by*dz
+            ENDDO
+            ! depth average
+            bpgx = bpgx/BC3D_Z(idzmax+1)
+            bpgy = bpgy/BC3D_Z(idzmax+1)
+         ENDIF
+         ! area weight and sum
+         BPG_ADCx(NM1) = BPG_ADCx(NM1) + Areas(IE)*bpgx
+         BPG_ADCx(NM2) = BPG_ADCx(NM2) + Areas(IE)*bpgx
+         BPG_ADCx(NM3) = BPG_ADCx(NM3) + Areas(IE)*bpgx
+         BPG_ADCy(NM1) = BPG_ADCy(NM1) + Areas(IE)*bpgy
+         BPG_ADCy(NM2) = BPG_ADCy(NM2) + Areas(IE)*bpgy
+         BPG_ADCy(NM3) = BPG_ADCy(NM3) + Areas(IE)*bpgy
+      ENDDO
+      ! divide by totalarea
+      DO IP = 1,NP
+         IF (TotalArea(IP).GT.0d0) THEN
+            BPG_ADCx(IP) = BPG_ADCx(IP)/TotalArea(IP)
+            BPG_ADCy(IP) = BPG_ADCy(IP)/TotalArea(IP)
+         ELSE
+            BPG_ADCx(IP) = 0d0
+            BPG_ADCy(IP) = 0d0
+         ENDIF
+      ENDDO 
+!-----------------------------------------------------------------------
+      END SUBROUTINE Calc_BC2D_ADCIRC
 !-----------------------------------------------------------------------
       function haversine(deglon1,deglon2,deglat1,deglat2) result (dist)
           ! great circle distance -- adapted from Matlab 
