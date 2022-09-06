@@ -83,6 +83,9 @@
                                          Dphi1Dy, Dphi2Dy, Dphi3Dy
 !     Area-averaged nodal derivatives
       REAL*8,ALLOCATABLE,DIMENSION(:) :: BPG_ADCx, BPG_ADCy
+!     Other output variables
+      REAL*8,ALLOCATABLE,DIMENSION(:) :: NB_ADC, NM_ADC, SigTS_ADC,&
+                                         MLD_ADC
 !-----------------------------------------------------------------------
 
 !.......Initialize MPI
@@ -330,9 +333,6 @@
             allocate(DUU(NX,NY), DVV(NX,NY), BC2D_KE(NX,NY),&
                      DUV(NX,NY), DU(NX,NY), DV(NX,NY), B(NX,NY))
          endif
-         ! If OutType = 3 allocate ADCIRC grid size values
-         IF (OutType.EQ.3) THEN
-            ALLOCATE(  )
 
          ! Read the latitude, longitude and z variables 
          call Check_err(NF90_INQ_VARID(NC_ID,'lat',Temp_ID))
@@ -973,16 +973,20 @@
 !-----------------------------------------------------------------------
       SUBROUTINE Calc_BC2D_ADCIRC()
       IMPLICIT NONE
-      REAL*8 :: RHO, RHOAVG, BX_AVG, BY_AVG, BX_Z, BY_Z, DZ
-      REAL*8 :: UAVG, VAVG, DUUX, DVVY, DUVX, DUVY, VEL, CD, CDX, CDY 
+      REAL*8 :: RHO, RHOAVG, DZ
       REAL*8 :: SA(NZ), CT(NZ), LAT(NZ), N2(NZ-1), ZMID(NZ-1),&
                 BCP_ADC(NZ,NP)
-      INTEGER  :: I, J, K, II, KB, KBX, KBY, IP, IM
       REAL(SZ) :: FV = -3D4, FVP = -3D4 + 1D-3, VS = 1D-3 
-      ! define fill values
-      real(sz) :: FV = -3d4, FVP = -3d4 + 1d-3, Vs = 1d-3
       ! persistent logical for if we are on the first call
       LOGICAL,SAVE :: FirstCall = .TRUE.
+      ! looping variables for do loops
+      INTEGER :: IP, IE, iz, idzmax, truebottom, NM1, NM2, NM3
+      ! for calculating baroclinic pressures
+      REAL*8 :: xx, yy, sp1, sp2, sp3, sp4, t1, t2, t3, t4,&
+                sa1, sa2, sa3, sa4, ct1, ct2, ct3, ct4
+      ! for calculating baroclinic pressure gradients
+      REAL*8 :: ddx1, ddx2, ddx3, ddy1, ddy2, ddy3, bpgx, bpgy,&
+                bcp1, bcp2, bcp3, bx, by, facval
       ! allocate output arrays if on the first call
       IF (FirstCall) THEN
          ALLOCATE( BPG_ADCx(NP), BPG_ADCy(NP), SigTS_ADC(NP),&
@@ -1033,7 +1037,7 @@
             IF (sp1.lt.FVP .OR. sp2.lt.FVP .OR.&
                 sp3.lt.FVP .OR. sp4.lt.FVP .OR.&
                 t1.lt.FVP  .OR. t2.lt.FVP .OR.&
-                t3.lt.FVP  .OR. t4.lt.FVP .OR.) THEN
+                t3.lt.FVP  .OR. t4.lt.FVP) THEN
                BCP_ADC(iz,IP) = FV
             ELSE
                ! convert to absolute salinity
@@ -1074,7 +1078,7 @@
             CALL gsw_Nsquared(SA(1:truebottom),CT(1:truebottom),&
                               BC3D_Z(1:truebottom),Lat(1:truebottom),&
                               N2(1:truebottom-1),zmid(1:truebottom-1))
-            NB_ADC = SQRT(MAX(0d0,N2(truebottom-1)))
+            NB_ADC(IP) = SQRT(MAX(0d0,N2(truebottom-1)))
             ! integrate to get depth-averaged value. Since gsw_Nsquared
             ! returns the value at the midpoint I will assume that is
             ! the average in that z-level
@@ -1086,8 +1090,7 @@
             ! Get Mixed-layer depth in case I decide I need it
             MLD_ADC(IP) = min(DFV,&
                              gsw_mlp(SA(1:truebottom),CT(1:truebottom),&
-                                  BC3D_Z(1:truebottom),&
-                                  BC3D_z(truebottom))
+                               BC3D_Z(1:truebottom)))/BC3D_Z(truebottom)
          ENDIF
       ENDDO
       !
