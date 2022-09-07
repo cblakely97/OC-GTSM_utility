@@ -161,10 +161,8 @@
             CALL Calc_Areas()
             ! calculate dphi/dx, dphi/dy
             CALL Calc_Derivatives()
-            ALLOCATE( BPG_ADCx(NP) )
-            BPG_ADCx = 0d0
-            CALL DFDxy_nodal( NM, NE, NP, SLAM, Dphi1Dx, Dphi2Dx, &
-                              Dphi3Dx, Areas, TotalArea, BPG_ADCx )
+            !CALL DFDxy_nodal( NM, NE, NP, SLAM, Dphi1Dx, Dphi2Dx, &
+            !                  Dphi3Dx, Areas, TotalArea, BPG_ADCx )
             !CALL Write_Check_Of_Mesh()
          else
             write(6,*) 'ERROR: Invalid OutType = ',OutType
@@ -204,15 +202,29 @@
       write(6,*) 'MyProc = ',myProc,'CurDT = ',CurDT%isoformat(' ')
       EndCheck = TEDT - CurDT; IT = 0
       do while (EndCheck%total_seconds() >= 0)
-         do ii = 1,max(OutType,1)
+         IF (OutType.LT.3) THEN
+            do ii = 1,max(OutType,1)
+               ! Download new OGCM NetCDF file
+               call BC3DDOWNLOAD(CurDT,ii,OKflag)            
+               if (.not.OKflag) exit
+               ! Read the OGCM NetCDF file
+               call Read_BC3D_NetCDF(ii)
+               ! Calculate the new BC2D terms.
+               call Calc_BC2D_Terms(ii)
+               CALL Write_Check_Of_Mesh()
+               CALL MPI_finalize(ierr);stop
+            end do
+         ELSEIF (OutType.EQ.3) THEN
             ! Download new OGCM NetCDF file
-            call BC3DDOWNLOAD(CurDT,ii,OKflag)            
+            call BC3DDOWNLOAD(CurDT,1,OKflag)            
             if (.not.OKflag) exit
             ! Read the OGCM NetCDF file
-            call Read_BC3D_NetCDF(ii)
+            call Read_BC3D_NetCDF(3)
             ! Calculate the new BC2D terms.
-            call Calc_BC2D_Terms(ii)
-         end do
+            call Calc_BC2D_Terms(3)
+            CALL Write_Check_Of_Mesh()
+            CALL MPI_finalize(ierr);stop
+         ENDIF
          ! Put new BC2D terms in netCDF output file
          !call UpdateNetCDF(IT,OKflag)
          ! Update the time 
@@ -362,12 +374,12 @@
          ! 0-360 coordinates 
          IF (OutType.EQ.3) THEN
             DO i = 1,NY
-               IF (BC3D_Lon(i).lt.0d0) THEN
-                  BC3D_Lon(i) = BC3D_Lon(i) + 360d0
-               ENDIF
+               !IF (BC3D_Lon(i).lt.0d0) THEN
+               !   BC3D_Lon(i) = BC3D_Lon(i) + 360d0
+               !ENDIF
             ENDDO
             ! get weights and indices for linear interpolation
-            !CALL Get_Interpolation_Weights()
+            CALL Get_Interpolation_Weights()
          ENDIF
       endif
       BC3D_Lon_s = BC3D_Lon(1)
@@ -990,7 +1002,7 @@
       ! allocate output arrays if on the first call
       IF (FirstCall) THEN
          ALLOCATE( BPG_ADCx(NP), BPG_ADCy(NP), SigTS_ADC(NP),&
-                   NB_ADC(NP), NM_ADC(NP) ) 
+                   NB_ADC(NP), NM_ADC(NP), MLD_ADC(NP) ) 
          FirstCall = .FALSE.
       ENDIF
       ! reset all values to 0
@@ -1000,6 +1012,7 @@
       SigTS_ADC = 0d0
       NB_ADC    = 0d0
       NM_ADC    = 0d0
+      MLD_ADC   = 0d0
       !
       ! get BCP_ADC, SigTS_ADC, NB_ADC, and NM_ADC
       !
@@ -1140,8 +1153,13 @@
                bpgy = bpgy + facval*by*dz
             ENDDO
             ! depth average
-            bpgx = bpgx/BC3D_Z(idzmax+1)
-            bpgy = bpgy/BC3D_Z(idzmax+1)
+            IF (BC3D_Z(idzmax+1).GT.0) THEN
+               bpgx = bpgx/BC3D_Z(idzmax+1)
+               bpgy = bpgy/BC3D_Z(idzmax+1)
+            ELSE
+               bpgx = 0d0
+               bpgy = 0d0
+            ENDIF
          ENDIF
          ! area weight and sum
          BPG_ADCx(NM1) = BPG_ADCx(NM1) + Areas(IE)*bpgx
@@ -1153,6 +1171,8 @@
       ENDDO
       ! divide by totalarea
       DO IP = 1,NP
+         BPG_ADCx(IP) = G/RhoWat0*BPG_ADCx(IP)
+         BPG_ADCy(IP) = G/RhoWat0*BPG_ADCy(IP)
          IF (TotalArea(IP).GT.0d0) THEN
             BPG_ADCx(IP) = BPG_ADCx(IP)/TotalArea(IP)
             BPG_ADCy(IP) = BPG_ADCy(IP)/TotalArea(IP)
@@ -1491,9 +1511,9 @@
       ! read in lat, lon, depth
       DO ii = 1,NP
          READ(14,*) dmy, slam(ii), sfea(ii), dp(ii)
-         IF (SLAM(II).LT.0d0) THEN
-            SLAM(II) = SLAM(II) + 360d0
-         ENDIF
+         !IF (SLAM(II).LT.0d0) THEN
+         !   SLAM(II) = SLAM(II) + 360d0
+         !ENDIF
       ENDDO
       ! read in connectivity table
       DO ii = 1,NE
@@ -1891,13 +1911,13 @@
       SUBROUTINE Write_Check_Of_Mesh()
       IMPLICIT NONE
       integer :: ii
-      OPEN(15,FILE='check_dphi2dx.14',STATUS='replace', &
+      OPEN(15,FILE='check_sigts.14',STATUS='replace', &
           access='sequential',&
           action='write')
       write(15,*) 'test'
       write(15,*) NE, NP
       do ii = 1,NP
-         WRITE(15,1000) ii, slam(ii), sfea(ii), BPG_ADCx(ii)
+         WRITE(15,1000) ii, slam(ii), sfea(ii), SigTS_ADC(ii)
       end do
       do ii = 1,NE
          WRITE(15,*) ii, '3', NM(ii,1), nm(ii,2), nm(ii,3)
@@ -1991,6 +2011,7 @@
       ! lets get those indices
       DO ii = 1,NP
          xx = SLAM(ii)
+         IF (MINVAL(BC3D_Lon).GE.0d0.AND.xx.LT.0d0) xx = xx + 360d0
          yy = SFEA(ii)
          bb = DP(ii)
          ! xy first
@@ -2072,8 +2093,8 @@
       denom = x2x1*y2y1
          
       if (denom < 1e-12) then
-         write(16,*) 'Denominator is small',denom
-         write(16,*) x,y,x1,y1,x2,y2,i,j,ir,jr
+         write(6,*) 'Denominator is small',denom
+         write(6,*) x,y,x1,y1,x2,y2,i,j,ir,jr
       endif
         
       ! Output the indices
