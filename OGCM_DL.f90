@@ -21,11 +21,11 @@
 !     kinetic energy from OGCM 3D velocities
 
 !     Use below two lines for output in single precision (saves space)
-      integer  :: nf90_type = nf90_float  ! Type to store matrix arrays in NetCDF
-      integer,parameter  :: sz = 4 !
+!      integer  :: nf90_type = nf90_float  ! Type to store matrix arrays in NetCDF
+!      integer,parameter  :: sz = 4 !
 !     Use below two lines for output in double precision
-!      integer  :: nf90_type = nf90_double ! Type to store matrix arrays in NetCDF
-!     integer,parameter  :: sz = 8 !
+      integer  :: nf90_type = nf90_double ! Type to store matrix arrays in NetCDF
+      integer,parameter  :: sz = 8 !
 
       character(len=80) :: BC3D_Name ! Name of the BC3D netCDF file 
       integer  :: BC3Ddir     ! orientaton of longitude 
@@ -60,7 +60,8 @@
               CD_id, NYYY_dim_id, NY_dim_id, NYY_dim_id, MLD_id, NM_id,&
               SigTS_id, BPGX_id, BPGY_id, NB_id, lon_id, lat_id, KE_id,&
               latc_id, lats_id, lonc_id, strlen_dim_id, DispX_id, &
-              DispY_id
+              DispY_id, depth_id, ele_id, node_dim_id, nele_dim_id, &
+              nvertex_dim_id
 !     CPB: Variables for outputting on ADCIRC grid. I did my best to
 !     make sure that variable names match what is in ADCIRC source code.
       CHARACTER(len=40) :: fort14 ! name of fort.14 grid file
@@ -221,7 +222,7 @@
             call Calc_BC2D_Terms(3)
          ENDIF
          ! Put new BC2D terms in netCDF output file
-         !call UpdateNetCDF(IT,OKflag)
+         call UpdateNetCDF(IT,OKflag)
          ! Update the time 
          CurDT = CurDT + timedelta(hours=mnProc*BC3D_DT*TMULT)
          EndCheck = TEDT - CurDT
@@ -1181,10 +1182,6 @@
             BPG_ADCx(IP) = BPG_ADCx(IP)/TotalArea(IP)
             BPG_ADCy(IP) = BPG_ADCy(IP)/TotalArea(IP)
          ELSE
-            WRITE(6,*) 'TotalArea less than 0 and it shouldnt be'
-            WRITE(6,*) 'x = ',slam(ip),' y = ',sfea(ip)
-            WRITE(6,*) 'TotalArea = ',TotalArea(ip)
-            CALL MPI_FInalize(ierr);stop
             BPG_ADCx(IP) = 0d0
             BPG_ADCy(IP) = 0d0
          ENDIF
@@ -1337,6 +1334,8 @@
          if (OutType.eq.2) &
             call check_err(nf90_put_var(ncid, lats_id,BC3D_Lat(2:NY-1)))
          call check_err(nf90_close(ncid))
+      ELSEIF ( .not.Fexist.AND.OutType.Eq.3 ) THEN
+         CALL initNetCDF_adc()
       endif
       ! Barrier to ensure wait until netcdf is created by first
       ! processor
@@ -1374,8 +1373,100 @@
          endif
          call check_err(nf90_close(ncid))
       endif
- 
       end subroutine initNetCDF
+!-----------------------------------------------------------------------
+!-----------------------------------------------------------------------
+!     S U B R O U T I N E    I N I T N E T C D F _ ADC
+!-----------------------------------------------------------------------
+      subroutine initNetCDF_adc()
+      implicit none
+      logical :: Fexist 
+      integer :: ierr, data_dims(3), TEE 
+      type(timedelta) :: DT
+      type(datetime)  :: TNDT
+      character(len=16) :: TSS
+      !
+      ! print to screen for intormation
+      !
+      WRITE(6,*) 'INFO: initializing NetCDF for ADCIRC output'
+      !
+      ! Open file  
+      !
+      call check_err(nf90_create(BC2D_Name, ncformat, ncid))
+      !
+      ! Define dimensions
+      !
+      call check_err(nf90_def_dim(ncid, 'time', nf90_unlimited, &
+                     timenc_dim_id))
+      call check_err(nf90_def_dim(ncid, 'strlen', 16, strlen_dim_id))
+      call check_err(nf90_def_dim(ncid,'node',NP,node_dim_id))
+      call check_err(nf90_def_dim(ncid,'nele',NE,nele_dim_id))
+      call check_err(nf90_def_dim(ncid,'nvertex',3,nvertex_dim_id))
+      !
+      ! define variables
+      !
+      data_dims = [strlen_dim_id, timenc_dim_id, 1]
+      !
+      ! define time variable
+      !
+      call def_var_att(ncid,'time',nf90_char, data_dims(1:2), &
+                       timenc_id,'UTC datetime','YYYY-MM-DD HH:mm')
+      !
+      ! define mesh variables (x, y, element, b)
+      !
+      call def_var_att(ncid,'x',nf90_double, [node_dim_id], &
+                       lon_id,'longitude','degrees')
+      call def_var_att(ncid,'y',nf90_double, [node_dim_id], &
+                          lat_id,'latitude','degrees')
+      call def_var_att(ncid,'depth',nf90_double, [node_dim_id], &
+                          depth_id,'distance below geoid','m')
+      call def_var_att(ncid,'element',nf90_int,&
+                          [nele_dim_id, nvertex_dim_id], &
+                          ele_id,'element','nondimensional')
+      !
+      ! define calculated values
+      !
+      data_dims = [node_dim_id,timenc_dim_id,1]
+      call def_var_att(ncid,'BPGX',nf90_type, data_dims(1:2), BPGX_id, &
+                     'east-west depth-averaged baroclinic pressure '&
+                     //'gradient','ms^-2')
+      call def_var_att(ncid,'BPGY',nf90_type, data_dims(1:2), BPGY_id, &
+                 'north-south depth-averaged baroclinic pressure '&
+                   //'gradient','ms^-2')
+      call def_var_att(ncid,'SigTS',nf90_type, data_dims(1:2),   &
+                     SigTS_id, 'surface sigmat density',  &
+                     'kgm^-3',SigT0)
+      call def_var_att(ncid,'MLD',nf90_type, data_dims(1:2), MLD_id, &
+                     'mixed-layer depth ratio','[]',DFV)
+      call def_var_att(ncid,'NB',nf90_type, data_dims(1:2), NB_id, &
+                      'buoyancy frequency at the seabed','s^-1')
+      call def_var_att(ncid,'NM',nf90_type, data_dims(1:2), NM_id, &
+                      'depth-averaged buoyancy frequency','s^-1')
+      !
+      ! Allowing vars to deflate
+      !
+      call check_err(nf90_def_var_deflate(ncid, lon_id, 1, 1, dfl))
+      call check_err(nf90_def_var_deflate(ncid, lat_id, 1, 1, dfl))
+      call check_err(nf90_def_var_deflate(ncid, depth_id, 1, 1, dfl))
+      call check_err(nf90_def_var_deflate(ncid, ele_id, 1, 1, dfl))
+      call check_err(nf90_def_var_deflate(ncid, BPGX_id, 1,1,dfl))
+      call check_err(nf90_def_var_deflate(ncid, BPGY_id, 1,1,dfl))
+      call check_err(nf90_def_var_deflate(ncid, SigTS_id,1,1,dfl))
+      call check_err(nf90_def_var_deflate(ncid, MLD_id,  1,1,dfl))
+      call check_err(nf90_def_var_deflate(ncid, NB_id, 1, 1, dfl))
+      call check_err(nf90_def_var_deflate(ncid, NM_id, 1, 1, dfl))
+      ! 
+      ! put on mesh variables
+      !
+      call check_err(nf90_put_var(ncid, lon_id, SLAM))
+      call check_err(nf90_put_var(ncid, lat_id, SFEA))
+      call check_err(nf90_put_var(ncid, depth_id, DP))
+      call check_err(nf90_put_var(ncid, ele_id, NM))
+      !
+      ! close file
+      !
+      call check_err(nf90_close(ncid))
+      end subroutine initNetCDF_adc
 !-----------------------------------------------------------------------
 !-----------------------------------------------------------------------
 !     S U B R O U T I N E    D E F _ V A R _ A T T
@@ -1403,7 +1494,7 @@
       end subroutine def_var_att       
 !-----------------------------------------------------------------------
 !-----------------------------------------------------------------------
-!     S U B R O U T I N E    I N I T _ N E T C D F
+!     S U B R O U T I N E    U P D A T E N E T C D F
 !-----------------------------------------------------------------------
       subroutine UpdateNetCDF(IT,OKflag)
       implicit none
@@ -1418,10 +1509,13 @@
       endif
 
       !start = [1, 1, mnProc*IT + myProc + tsind];
-      kount = [NX, NY, 1];
-      kountY = [NX, NY-1, 1];
-      kountYY = [NX, NY-2, 1];
- 
+      IF (OutType.LT.3) THEN
+         kount = [NX, NY, 1];
+         kountY = [NX, NY-1, 1];
+         kountYY = [NX, NY-2, 1];
+      ELSE
+         kount = [1,NP,1]
+      ENDIF
       if ( (IT > 0 .or. myProc > 0) .and. mnProc > 1) then
          ! Receiving message from prev processor to start writing
          call mpi_recv(startT,1,mpi_integer,prevProc,0,MPI_Comm_World,&
@@ -1441,20 +1535,35 @@
          call check_err(nf90_put_var(ncid, timenc_id,    &
                         CurDT%strftime("%Y-%m-%d %H:%M"),&
                         [1, start(3)],[16, kount(3)]))
-         if (OutType.gt.0) then
-            call put_var(ncid, BPGX_id,BC2D_BX, start, kount)
-            call put_var(ncid, BPGY_id, BC2D_BY, start, kountY)
-            call put_var(ncid, SigTS_id, BC2D_SigTS, start, kount)
-            call put_var(ncid, MLD_id, BC2D_MLD, start, kount)
-         endif
-         call put_var(ncid, NB_id, BC2D_NB, start, kount)
-         call put_var(ncid, NM_id, BC2D_NM, start, kount)
-         if (OutType.eq.2) then
-            call put_var(ncid, KE_id, BC2D_KE, start, kount)
-            call put_var(ncid, CD_id, BC2D_CD, start, kountYY)
-            call put_var(ncid, DispX_id, BC2D_DispX, start, kountYY)
-            call put_var(ncid, DispY_id, BC2D_DispY, start, kountYY)
-         endif
+         IF (OutType.LT.3) THEN
+            if (OutType.gt.0) then
+               call put_var(ncid, BPGX_id,BC2D_BX, start, kount)
+               call put_var(ncid, BPGY_id, BC2D_BY, start, kountY)
+               call put_var(ncid, SigTS_id, BC2D_SigTS, start, kount)
+               call put_var(ncid, MLD_id, BC2D_MLD, start, kount)
+            endif
+            call put_var(ncid, NB_id, BC2D_NB, start, kount)
+            call put_var(ncid, NM_id, BC2D_NM, start, kount)
+            if (OutType.eq.2) then
+               call put_var(ncid, KE_id, BC2D_KE, start, kount)
+               call put_var(ncid, CD_id, BC2D_CD, start, kountYY)
+               call put_var(ncid, DispX_id, BC2D_DispX, start, kountYY)
+               call put_var(ncid, DispY_id, BC2D_DispY, start, kountYY)
+            endif
+         ELSEIF (OutType.EQ.3) THEN
+            call put_var_adc(ncid, BPGX_id, BPG_ADCx, start(2:3), &
+                         kount(2:3))
+            call put_var_adc(ncid, BPGY_id, BPG_ADCy, start(2:3), & 
+                         kount(2:3))
+            call put_var_adc(ncid, SigTS_id, SigTS_ADC, start(2:3),&
+                         kount(2:3))
+            call put_var_adc(ncid, MLD_id, MLD_ADC, start(2:3), &
+                             kount(2:3))
+            call put_var_adc(ncid, NB_id, NB_ADC, start(2:3), &
+                             kount(2:3))
+            call put_var_adc(ncid, NM_id, NM_ADC, start(2:3), &
+                             kount(2:3))
+         ENDIF
          call check_err(nf90_close(ncid))
       else
          write(6,*) 'Skipping Update of NetCDF:',&
@@ -1492,6 +1601,18 @@
       endif
 !
       end subroutine put_var       
+!-----------------------------------------------------------------------
+!     S U B R O U T I N E    P U T _ V A R _ ADC
+!-----------------------------------------------------------------------
+      subroutine put_var_adc(ncid, var_id, InArray, start, kount)
+      implicit none
+      integer,intent(in)  :: ncid, var_id, start(2), kount(2) 
+      real(sz),intent(in) :: InArray(:)
+      ! Write outinto netcdf
+      call check_err(nf90_put_var(ncid, var_id, InArray, &
+                     start, kount))
+!
+      end subroutine put_var_adc
 !-----------------------------------------------------------------------
 !     S U B R O U T I N E  R E A D _ F 1 4
 !-----------------------------------------------------------------------
