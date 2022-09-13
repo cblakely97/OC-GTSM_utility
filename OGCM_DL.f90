@@ -66,7 +66,7 @@
       CHARACTER(len=40) :: fort14 ! name of fort.14 grid file
       INTEGER :: NP, NE
       REAL*8,ALLOCATABLE,DIMENSION(:)   :: SLAM, SFEA, DP
-      REAL*8,PARAMETER :: SFEA0=PI/4d0, SLAM0 = 0d0
+      REAL*8,PARAMETER :: SFEA0=0d0, SLAM0 = 0d0
       INTEGER,ALLOCATABLE,DIMENSION(:,:) :: NM, NeiTabEle
 !     CPB: indices for spatial interpolation (use bilinear interpolation
 !     routine from ADCIRC)
@@ -77,12 +77,14 @@
 !     edgelengths for use in calculating derivatives. This is made in
 !     the Calc_Areas subroutine then used in Calc_Derivatives then it is
 !     no longer needed and is deallocated
-      REAL*8,ALLOCATABLE :: FDXE(:,:), FDYE(:,:), SFMXEle(:), SFMYEle(:)
+      REAL*8,ALLOCATABLE :: FDXE(:,:), FDYE(:,:), SFMXEle(:),&
+                            SFMYEle(:), xve(:,:), yve(:,:)
 !     Elemental derivatives of basis functions
       REAL*8,ALLOCATABLE,DIMENSION(:) :: Dphi1Dx, Dphi2Dx, Dphi3Dx, &
                                          Dphi1Dy, Dphi2Dy, Dphi3Dy
 !     Area-averaged nodal derivatives
       REAL*8,ALLOCATABLE,DIMENSION(:) :: BPG_ADCx, BPG_ADCy
+      REAL*8,ALLOCATABLE,DIMENSION(:,:) :: bcp_adc
 !     Other output variables
       REAL*8,ALLOCATABLE,DIMENSION(:) :: NB_ADC, NM_ADC, SigTS_ADC,&
                                          MLD_ADC
@@ -161,9 +163,6 @@
             CALL Calc_Areas()
             ! calculate dphi/dx, dphi/dy
             CALL Calc_Derivatives()
-            !CALL DFDxy_nodal( NM, NE, NP, SLAM, Dphi1Dx, Dphi2Dx, &
-            !                  Dphi3Dx, Areas, TotalArea, BPG_ADCx )
-            !CALL Write_Check_Of_Mesh()
          else
             write(6,*) 'ERROR: Invalid OutType = ',OutType
             call MPI_Finalize(ierr); stop
@@ -211,8 +210,6 @@
                call Read_BC3D_NetCDF(ii)
                ! Calculate the new BC2D terms.
                call Calc_BC2D_Terms(ii)
-               CALL Write_Check_Of_Mesh()
-               CALL MPI_finalize(ierr);stop
             end do
          ELSEIF (OutType.EQ.3) THEN
             ! Download new OGCM NetCDF file
@@ -222,8 +219,6 @@
             call Read_BC3D_NetCDF(3)
             ! Calculate the new BC2D terms.
             call Calc_BC2D_Terms(3)
-            CALL Write_Check_Of_Mesh()
-            CALL MPI_finalize(ierr);stop
          ENDIF
          ! Put new BC2D terms in netCDF output file
          !call UpdateNetCDF(IT,OKflag)
@@ -986,8 +981,8 @@
       SUBROUTINE Calc_BC2D_ADCIRC()
       IMPLICIT NONE
       REAL*8 :: RHO, RHOAVG, DZ
-      REAL*8 :: SA(NZ), CT(NZ), LAT(NZ), N2(NZ-1), ZMID(NZ-1),&
-                BCP_ADC(NZ,NP)
+      REAL*8 :: SA(NZ), CT(NZ), LAT(NZ), N2(NZ-1), ZMID(NZ-1)!,&
+                !BCP_ADC(NZ,NP)
       REAL(SZ) :: FV = -3D4, FVP = -3D4 + 1D-3, VS = 1D-3 
       ! persistent logical for if we are on the first call
       LOGICAL,SAVE :: FirstCall = .TRUE.
@@ -1003,6 +998,7 @@
       IF (FirstCall) THEN
          ALLOCATE( BPG_ADCx(NP), BPG_ADCy(NP), SigTS_ADC(NP),&
                    NB_ADC(NP), NM_ADC(NP), MLD_ADC(NP) ) 
+         ALLOCATE( bcp_adc(NZ,NP) )
          FirstCall = .FALSE.
       ENDIF
       ! reset all values to 0
@@ -1019,6 +1015,7 @@
       DO IP = 1,NP
          ! save lat and lon as yy,xx for readability
          xx = SLAM(IP)
+         IF (minval(BC3D_Lon).GE.0d0.AND.xx.lt.0d0) xx = xx + 360d0
          yy = SFEA(IP)
          ! get max depth we are using
          idzmax = INDZ(IP)
@@ -1054,10 +1051,17 @@
                BCP_ADC(iz,IP) = FV
             ELSE
                ! convert to absolute salinity
-               sa1 = gsw_SA_from_SP(max(2d0,sp1),BC3D_Z(iz),xx,yy)
-               sa2 = gsw_SA_from_SP(max(2d0,sp2),BC3D_Z(iz),xx,yy)
-               sa3 = gsw_SA_from_SP(max(2d0,sp3),BC3D_Z(iz),xx,yy)
-               sa4 = gsw_SA_from_SP(max(2d0,sp4),BC3D_Z(iz),xx,yy)
+               sa1 = gsw_SA_from_SP(max(2d0,sp1),BC3D_Z(iz),&
+                            BC3D_Lon(INDXY(1,IP)),BC3D_LAT(INDXY(2,IP)))
+               !
+               sa2 = gsw_SA_from_SP(max(2d0,sp2),BC3D_Z(iz),&
+                            BC3D_Lon(INDXY(3,IP)),BC3D_LAT(INDXY(2,IP)))
+               !
+               sa3 = gsw_SA_from_SP(max(2d0,sp3),BC3D_Z(iz),&
+                            BC3D_Lon(INDXY(1,IP)),BC3D_LAT(INDXY(4,IP)))
+               !
+               sa4 = gsw_SA_from_SP(max(2d0,sp4),BC3D_Z(iz),&
+                            BC3D_Lon(INDXY(3,IP)),BC3D_LAT(INDXY(4,IP)))
                ! convert to conservative temperature
                ct1 = gsw_CT_from_T(sa1,dble(t1),BC3D_Z(iz))
                ct2 = gsw_CT_from_T(sa2,dble(t2),BC3D_Z(iz))
@@ -1177,6 +1181,10 @@
             BPG_ADCx(IP) = BPG_ADCx(IP)/TotalArea(IP)
             BPG_ADCy(IP) = BPG_ADCy(IP)/TotalArea(IP)
          ELSE
+            WRITE(6,*) 'TotalArea less than 0 and it shouldnt be'
+            WRITE(6,*) 'x = ',slam(ip),' y = ',sfea(ip)
+            WRITE(6,*) 'TotalArea = ',TotalArea(ip)
+            CALL MPI_FInalize(ierr);stop
             BPG_ADCx(IP) = 0d0
             BPG_ADCy(IP) = 0d0
          ENDIF
@@ -1511,9 +1519,6 @@
       ! read in lat, lon, depth
       DO ii = 1,NP
          READ(14,*) dmy, slam(ii), sfea(ii), dp(ii)
-         !IF (SLAM(II).LT.0d0) THEN
-         !   SLAM(II) = SLAM(II) + 360d0
-         !ENDIF
       ENDDO
       ! read in connectivity table
       DO ii = 1,NE
@@ -1570,7 +1575,6 @@
          NEICOUNT(NM1) = NEICOUNT(NM1) + 1
          NEICOUNT(NM2) = NEICOUNT(NM2) + 1
          NEICOUNT(NM3) = NEICOUNT(NM3) + 1
-         !WRITE(6,*) 'neicount_max = ', maxval(neicount)
          NeiTabEle(NM1,NEICOUNT(NM1)) = ii
          NeiTabEle(NM2,NEICOUNT(NM2)) = ii
          NeiTabEle(NM3,NEICOUNT(NM3)) = ii
@@ -1594,17 +1598,35 @@
       ! dummy variables for holding elemental nodes
       REAL*8,DIMENSION(3) :: LATVE, LONVE, XVE, YVE
       ! looping variable
-      INTEGER :: ii
+      INTEGER :: ii, NMTEMP(3)
       ! Intermediate variables to make this more readable while building
       ! areas, etc.
       REAL*8 :: x1, x2, x3, y1, y2, y3, &
                 x2mx1, x3mx2, x1mx3, &
                 y2my1, y3my2, y1my3
+      ! jacobian to check if ccw
+      REAL*8 :: JAC1, DLED1
 
       ! allocate Areas, TotalArea, FDXE, FDYE 
       ALLOCATE( Areas(NE), TotalArea(NP), FDXE(3,NE), FDYE(3,NE) )
       TotalArea = 0d0
       DO ii = 1,NE
+         ! lon/lat in degrees
+         LONVE(1) = SLAM( NM(ii,1) )
+         LONVE(2) = SLAM( NM(ii,2) )
+         LONVE(3) = SLAM( NM(ii,3) )
+         LATVE(1) = SFEA( NM(ii,1) )
+         LATVE(2) = SFEA( NM(ii,2) )
+         LATVE(3) = SFEA( NM(ii,3) )
+         LONVE = MODULO(LONVE,360d0)
+         CALL Cal_Jac(JAC1,LONVE,LATVE)
+         CALL Cal_Edgelength( DLED1, LONVE, LATVE )
+         IF ( JAC1.LT.0d0.AND.DLED1.LT.360) THEN
+             NMTEMP = NM(ii,:)
+             NM(ii,1) = NMTEMP(3)
+             NM(ii,2) = NMTEMP(2)
+             NM(ii,3) = NMTEMP(1)
+         ENDIF
          ! lon/lat in degrees
          LONVE(1) = SLAM( NM(ii,1) )
          LONVE(2) = SLAM( NM(ii,2) )
@@ -1636,7 +1658,7 @@
          FDYE(2,ii) =  X1mX3 
          FDYE(3,ii) =  X2mX1 
          ! store areas
-         AREAS(ii)=abs((X1mX3)*(-Y3mY2)+(X3mX2)*(Y1mY3))
+         AREAS(ii)=0.5d0*((X1mX3)*(-Y3mY2)+(X3mX2)*(Y1mY3))
          ! get totalarea
          TotalArea(NM(ii,1)) = TotalArea(NM(ii,1)) + Areas(ii)
          TotalArea(NM(ii,2)) = TotalArea(NM(ii,2)) + Areas(ii)
@@ -1664,7 +1686,6 @@
       REAL*8 :: sfdxfac, sfdyfac, AreaIE2, AreaEle
       ! allocate memory for derivatives and adjustment factors for
       ! derivative calculations
-      WRITE(6,*) 'inside Calc_Derivatives'
       ALLOCATE( Dphi1Dx(NE), Dphi2Dx(NE), Dphi3Dx(NE), &
                 Dphi1Dy(NE), Dphi2Dy(NE), Dphi3Dy(NE) )
       ! these are used in the calculation of the cylindrical projection
@@ -1673,7 +1694,7 @@
       ! convert to radians for this
       SLAM = SLAM*DEG2RAD
       SFEA = SFEA*DEG2RAD
-      WRITE(6,*) 'about to enter Compute_Cylinproj'
+      !WRITE(6,*) 'about to enter Compute_Cylinproj'
       CALL COMPUTE_CYLINPROJ_SFAC( SLAM, SFEA )
       ! back to degrees
       SLAM = SLAM*RAD2DEG
@@ -1724,46 +1745,47 @@
 !-----------------------------------------------------------------------
       IMPLICIT NONE
       REAL*8, DIMENSION(:):: XVE, YVE, LONVE, LATVE
-      
+      INTEGER :: ELEID 
       !c Local 
       INTEGER:: II, IDX, SPF
       REAL*8:: XC, YC
       REAL*8:: Jac1, Jac2
-      REAL*8, dimension(3):: LONM, LATM, LONTMP
+      REAL*8, dimension(3):: LONM, LATM, LONTMP, LATTMP
       REAL*8, dimension(3):: DLX, DL
       REAL*8 :: DLED1, DLED2
   
       LATM(:) = LATVE(1:3)
+      LATTMP(:) = LATVE(1:3)
       !c Adjust so that 0 <= lon <= 360 
-      LONM(:) = MODULO( LONVE(1:3), 360.0_SZ ) ; 
+      LONM(:) = MODULO( LONVE(1:3), 360.0d0 ) ; 
       LONTMP = LONM ; 
       CALL CAL_JAC( Jac1, LONM, LATM )
       CALL CAL_EDGELENGTH( DLED1, LONM, LATM ) ; 
    
       SPF = 0 ; 
-      IF (  Jac1 < 0.0_SZ .OR. &
-          (Jac1 > 0.0_SZ .AND. DLED1 > 360.0_SZ ) ) THEN
+      IF (  Jac1 < 0.0d0 .OR. &
+          (Jac1 > 0.0d0 .AND. DLED1 > 360.0d0 ) ) THEN
          !c An element has a circular index. 
          !c Put a wrapped node on the other side
          !c A wrapped node is on the left of 180
-         IF ( COUNT( LONM > 180.0_SZ ) == 1 ) THEN
+         IF ( COUNT( LONM > 180.0d0 ) == 1 ) THEN
             IDX = sum( merge( (/ 1, 2, 3 /), &
-                (/ 0, 0, 0 /), LONM > 180.0_SZ ) ) ;
-            LONM(IDX) = LONM(IDX) - 360.0_SZ ; 
+                (/ 0, 0, 0 /), LONM > 180.0d0 ) ) ;
+            LONM(IDX) = LONM(IDX) - 360.0d0 ; 
          END IF
          
          !c A wrapped node is on the right of 180
-         IF ( COUNT( LONM < 180.0_SZ ) == 1 ) THEN
+         IF ( COUNT( LONM < 180.0d0 ) == 1 ) THEN
             IDX = sum( merge( (/ 1, 2, 3 /), &
-                (/ 0, 0, 0 /), LONM < 180.0_SZ ) ) ;
+                (/ 0, 0, 0 /), LONM < 180.0d0 ) ) ;
             
-            LONM(IDX) = LONM(IDX) + 360.0_SZ ; 
+            LONM(IDX) = LONM(IDX) + 360.0d0 ; 
          END IF        
          CALL CAL_JAC( Jac2, LONM, LATM )
          CALL CAL_EDGELENGTH( DLED2, LONM, LATM ) ; 
          SPF = 1 ;
-         IF ( Jac2 < 0.0_SZ .OR. &
-             (Jac1 > 0.0_SZ .AND. DLED2 > DLED1) ) THEN
+         IF ( Jac2 < 0.0d0 .OR. &
+             (Jac1 > 0.0d0 .AND. DLED2 > DLED1) ) THEN
             LONM = LONTMP ;  
             SPF = 0 ; 
          END IF
@@ -1775,7 +1797,7 @@
       DO II = 1, 3
          ! set slam0 and sfea0 to just be 0 and 45 since that is what I
          ! do in my fort.15
-         CALL CYLINDERMAP(XC, YC, LONM(II), LATM(II), 0d0, 45d0*deg2rad)
+         CALL CYLINDERMAP(XC, YC, LONM(II), LATM(II), slam0,sfea0)
          XVE(II) = XC ;
          YVE(II) = YC ; 
       END DO      
@@ -1800,8 +1822,8 @@
         IMPLICIT NONE
         REAL*8:: Jac, LON(3), LAT(3)
         REAL*8:: XR(2), XS(2)
-        XR = 0.5_SZ*(/ LON(2) - LON(1), LAT(2) - LAT(1) /) ; 
-        XS = 0.5_SZ*(/ LON(3) - LON(1), LAT(3) - LAT(1) /) ; 
+        XR = 0.5d0*(/ LON(2) - LON(1), LAT(2) - LAT(1) /) ; 
+        XS = 0.5d0*(/ LON(3) - LON(1), LAT(3) - LAT(1) /) ; 
         Jac = (XR(1)*XS(2) - XR(2)*XS(1)) ; ! Find Jacobian
         RETURN ;
       END SUBROUTINE CAL_JAC
@@ -1851,33 +1873,30 @@
 !     
 !.....DEFAULT:
 
-           MEXP = MOD(22,20) ; ! = 2 if mercator
+      MEXP = MOD(22,20) ; ! = 2 if mercator
 !......ICS = 20 : Equal area projection
 !......    = 21 : CPP
 !.....     = 22 : Mercartor
 !......from WP
-           WRITE(6,*) 'about to enter loop'
-           DO I = 1, NP
-              SFCT = cos(SFEAV(I))**MEXP ;           
-              SFCX = cos(SFEA0)*( cos(SFEAV(I))**(MEXP - 1) ) ;
-              SFCY = cos(SFEA0)**(MEXP - 1) ; 
-            
-              SFMX(I) = cos(SFEA0)/COS(SFEAV(I)) ;
-              SFMY(I) = SFMX(I)**(MEXP - 1) ;
-              TANPHI = (TAN(SFEAV(I))/Rearth) ;
-              YCSFAC = cos( SFEAV(I) ) ; 
-           END DO
-           WRITE(6,*) 'done with loop'
+      DO I = 1, NP
+         SFCT = cos(SFEAV(I))**MEXP ;           
+         SFCX = cos(SFEA0)*( cos(SFEAV(I))**(MEXP - 1) ) ;
+         SFCY = cos(SFEA0)**(MEXP - 1) ; 
+         
+         SFMX(I) = cos(SFEA0)/COS(SFEAV(I)) ;
+         SFMY(I) = SFMX(I)**(MEXP - 1) ;
+         TANPHI = (TAN(SFEAV(I))/Rearth) ;
+         YCSFAC = cos( SFEAV(I) ) ; 
+      END DO
         
 !     COMPUTE ELEMENT AVERAGE FROM NODAL VECTORS ADJUSTING EQUATIONS
 !     TO CYLINDER COORDINATES
-        CALL SFAC_ELEAVG( SFMXEle, SFMX, NM, NE ) ; 
-        CALL SFAC_ELEAVG( SFMYEle, SFMY, NM, NE ) ;         
-       WRITE(6,*) 'leaving compute_cylinproj_sfac'  
-       DEALLOCATE( SFMY, SFMX )
+      CALL SFAC_ELEAVG( SFMXEle, SFMX, NM, NE ) ; 
+      CALL SFAC_ELEAVG( SFMYEle, SFMY, NM, NE ) ;         
+      DEALLOCATE( SFMY, SFMX )
 !      Only need the  averages of these... 
         
-        RETURN ; 
+      RETURN ; 
 !----------------------------------------------------------------------
       END SUBROUTINE COMPUTE_CYLINPROJ_SFAC
 !----------------------------------------------------------------------
@@ -1908,16 +1927,18 @@
       END SUBROUTINE SFAC_ELEAVG 
 !----------------------------------------------------------------------
 !----------------------------------------------------------------------
-      SUBROUTINE Write_Check_Of_Mesh()
+      SUBROUTINE Write_Check_Of_Mesh(filename,outvalue)
       IMPLICIT NONE
       integer :: ii
-      OPEN(15,FILE='check_sigts.14',STATUS='replace', &
+      CHARACTER(len=12) :: filename
+      REAL*8,DIMENSION(:) :: outvalue
+      OPEN(15,FILE=trim(filename),STATUS='replace', &
           access='sequential',&
           action='write')
       write(15,*) 'test'
       write(15,*) NE, NP
       do ii = 1,NP
-         WRITE(15,1000) ii, slam(ii), sfea(ii), SigTS_ADC(ii)
+         WRITE(15,1000) ii, slam(ii), sfea(ii), outvalue(ii)
       end do
       do ii = 1,NE
          WRITE(15,*) ii, '3', NM(ii,1), nm(ii,2), nm(ii,3)
