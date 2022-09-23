@@ -89,6 +89,7 @@
 !     Other output variables
       REAL*8,ALLOCATABLE,DIMENSION(:) :: NB_ADC, NM_ADC, SigTS_ADC,&
                                          MLD_ADC
+      REAL*8 :: start,finish
 !-----------------------------------------------------------------------
 
 !.......Initialize MPI
@@ -108,8 +109,10 @@
       if (prevProc.lt.0) prevProc = mnProc - 1    
  
 !.......Read the Control File
+      call cpu_time(start)
       call Read_Input_File() 
-
+      call cpu_time(finish)
+      write(6,*) 'reading input took ',finish-start,' seconds'
 !.......Start the download and process loop
       call OGCM_Run()
   
@@ -202,6 +205,7 @@
       write(6,*) 'MyProc = ',myProc,'CurDT = ',CurDT%isoformat(' ')
       EndCheck = TEDT - CurDT; IT = 0
       do while (EndCheck%total_seconds() >= 0)
+         !call cpu_time(start)
          IF (OutType.LT.3) THEN
             do ii = 1,max(OutType,1)
                ! Download new OGCM NetCDF file
@@ -223,6 +227,8 @@
          ENDIF
          ! Put new BC2D terms in netCDF output file
          call UpdateNetCDF(IT,OKflag)
+         !call cpu_time(finish)
+         !write(6,*) 'elapsed time = ',finish-start,'seconds'
          ! Update the time 
          CurDT = CurDT + timedelta(hours=mnProc*BC3D_DT*TMULT)
          EndCheck = TEDT - CurDT
@@ -282,8 +288,9 @@
       integer,intent(in) :: NC_ID
       integer  :: Temp_ID, i, j, ii 
       real*8   :: BC3D_Lon_s, LatVal 
+      real*8,allocatable :: templon(:)
       LOGICAL,SAVE :: FirstCall = .TRUE.
-      INTEGER :: NY_temp ! to see if we swapped grids
+      INTEGER :: NY_temp, NX_temp ! to see if we swapped grids
         
       ! if this is not the first call, check to see if we have crossed
       ! over the time period from the GLBv0.08 grid to the GLBy0.08
@@ -294,7 +301,9 @@
       ! message. If we are using the ADCIRC grid then it will recompute
       ! the interpolants and continue outputting.
       IF (.NOT.FirstCall) THEN
+         !WRITE(6,*) 'checking grid'
          call Check_err(NF90_INQ_DIMID(NC_ID,'lat',Temp_ID))
+         !write(6,*) 'inquiring dim'
          Call Check_err(NF90_INQUIRE_DIMENSION(NC_ID,Temp_ID,&
                         len=NY_temp))
          IF (NY_temp.NE.NY.AND.OutType.LT.3) THEN
@@ -305,13 +314,32 @@
             CALL MPI_Finalize(ierr);stop
          ELSEIF (NY_temp.NE.NY) THEN
             ! deallocate all values we get from the input data
+            write(6,*) 'INFO: we have switched grids, recalculating'&
+                       //' interpolation weights.'
             DEALLOCATE( BC3D_Lat, BC3D_Lon, BC3D_Z, BC3D_SP, BC3D_T )
             FirstCall = .True.
          ENDIF
          ! test if we are still in the same lon coordinates (-180/180
          ! or 0/360)
+         !write(6,*) 'inquiring lon name'
          call Check_err(NF90_INQ_VARID(NC_ID,'lon',Temp_ID))
-         call Check_err(NF90_GET_VAR(NC_ID,Temp_ID,BC3D_Lon))
+         !write(6,*) 'inquiring lon dimension'
+         !Call Check_err(NF90_INQUIRE_DIMENSION(NC_ID,Temp_ID,&
+         !               len=NY_temp))
+         !write(6,*) 'NX_temp = ',ny_temp
+         !write(6,*) 'NX = ',NX
+         ALLOCATE( templon(NX) )
+         call Check_err(NF90_INQ_VARID(NC_ID,'lon',Temp_ID))
+         !write(6,*) 'reading in templon'
+         call Check_err(NF90_GET_VAR(NC_ID,Temp_ID,templon))
+         IF (minval(templon).ne.minval(BC3D_Lon)) THEN
+            write(6,*) 'INFO: we have switched grids, recalculating'&
+                       //' interpolation weights.'
+            ! deallocate all values we get from the input data
+            DEALLOCATE( BC3D_Lat, BC3D_Lon, BC3D_Z, BC3D_SP, BC3D_T )
+            FirstCall = .True.
+         ENDIF
+         DEALLOCATE( templon )
       ENDIF
       ! if this is the first call or we swap grids define all the
       ! various arrays and sizes we need
@@ -327,9 +355,10 @@
           
          ! Allocate the lat lon and z arrays first 
          allocate(BC3D_Lat(NY),BC3D_Lon(NX),BC3D_Z(NZ))
-         allocate(BC3D_SP(NX,NY,NZ),BC3D_T(NX,NY,NZ),BC3D_BCP(NX,NY,NZ))
+         allocate(BC3D_SP(NX,NY,NZ),BC3D_T(NX,NY,NZ))
          ! only need to allocate BC2D variables if OutType < 3
          IF (OutType.LT.3) THEN
+            ALLOCATE( BC3D_BCP(NX,NY,NZ) )
             allocate(BC2D_NB(NX,NY),BC2D_NM(NX,NY),&
                      BC2D_SigTS(NX,NY),BC2D_MLD(NX,NY))
             allocate(BC2D_BX(NX,NY),BC2D_BY(NX,NY-1),DX(NX,NY),&
@@ -375,6 +404,7 @@
                !ENDIF
             ENDDO
             ! get weights and indices for linear interpolation
+            WRITE(6,*) 'INFO: calculating interpolants'
             CALL Get_Interpolation_Weights()
          ENDIF
       endif
@@ -1504,10 +1534,10 @@
       integer  :: startT, mpistat(mpi_status_size)
     
       ! Make netcdf/get dimension and variable IDs 
+      write(6,*) 'IT = ',IT
       if (IT.eq.0) then 
          call initNetCDF()
       endif
-
       !start = [1, 1, mnProc*IT + myProc + tsind];
       IF (OutType.LT.3) THEN
          kount = [NX, NY, 1];
