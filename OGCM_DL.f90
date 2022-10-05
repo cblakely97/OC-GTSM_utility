@@ -183,6 +183,35 @@
       call MPI_Bcast(BCServer,3,MPI_Character,0,MPI_Comm_World,ierr)
       call MPI_Bcast(OutType,1,MPI_Integer,0,MPI_Comm_World,ierr)
       call MPI_Bcast(BC2D_Name,40,MPI_Character,0,MPI_Comm_World,ierr)
+      IF (OutType.EQ.3) THEN
+         ! broadcast NP and NE
+         CALL MPI_Bcast(NP,1,MPI_Integer,0,MPI_Comm_World,ierr)
+         CALL MPI_Bcast(NE,1,MPI_Integer,0,MPI_Comm_World,ierr)
+         ! allocate arrays on processors not equal to 0
+         IF (myproc.gt.0) THEN
+            ! allocate stuff
+            ALLOCATE(SLAM(NP), SFEA(NP), DP(NP), NM(NE,3))
+            ALLOCATE( Areas(NE), TotalArea(NP) )
+            ALLOCATE( Dphi1Dx(NE), Dphi2Dx(NE), Dphi3Dx(NE), &
+                      Dphi1Dy(NE), Dphi2Dy(NE), Dphi3Dy(NE) )
+         ENDIF
+         ! slam, sfea, DP
+         CALL MPI_Bcast(SLAM,NP,MPI_REAL,0,MPI_Comm_World,ierr)
+         CALL MPI_Bcast(SFEA,NP,MPI_REAL,0,MPI_Comm_World,ierr)
+         CALL MPI_Bcast(DP,NP,MPI_REAL,0,MPI_Comm_World,ierr)
+         ! NM
+         CALL MPI_Bcast(NM,size(NM),MPI_INTEGER,0,MPI_COMM_WORLD,ierr)
+         ! Areas, TotalArea
+         CALL MPI_Bcast(Areas,NE,MPI_REAL,0,MPI_Comm_World,ierr)
+         CALL MPI_Bcast(TotalArea,NP,MPI_REAL,0,MPI_Comm_World,ierr)
+         ! dphi_i
+         CALL MPI_Bcast(Dphi1Dx,NE,MPI_REAL,0,MPI_Comm_World,ierr)
+         CALL MPI_Bcast(Dphi2Dx,NE,MPI_REAL,0,MPI_Comm_World,ierr)
+         CALL MPI_Bcast(Dphi3Dx,NE,MPI_REAL,0,MPI_Comm_World,ierr) 
+         CALL MPI_Bcast(Dphi1Dy,NE,MPI_REAL,0,MPI_Comm_World,ierr)
+         CALL MPI_Bcast(Dphi2Dy,NE,MPI_REAL,0,MPI_Comm_World,ierr)
+         CALL MPI_Bcast(Dphi3Dy,NE,MPI_REAL,0,MPI_Comm_World,ierr) 
+      ENDIF
 !
       end subroutine Read_Input_File
 !
@@ -1537,6 +1566,7 @@
       write(6,*) 'IT = ',IT
       if (IT.eq.0) then 
          call initNetCDF()
+         write(6,*)'PROC ',myproc,'initiated netcdf'
       endif
       !start = [1, 1, mnProc*IT + myProc + tsind];
       IF (OutType.LT.3) THEN
@@ -1583,16 +1613,22 @@
          ELSEIF (OutType.EQ.3) THEN
             call put_var_adc(ncid, BPGX_id, BPG_ADCx, start(2:3), &
                          kount(2:3))
+            write(6,*) 'PROC',myProc,' succesfully applied BPGX'
             call put_var_adc(ncid, BPGY_id, BPG_ADCy, start(2:3), & 
                          kount(2:3))
+            write(6,*) 'PROC',myProc,' succesfully applied BPGY'
             call put_var_adc(ncid, SigTS_id, SigTS_ADC, start(2:3),&
                          kount(2:3))
+            write(6,*) 'PROC',myProc,' succesfully applied SigTS'
             call put_var_adc(ncid, MLD_id, MLD_ADC, start(2:3), &
                              kount(2:3))
+            write(6,*) 'PROC',myProc,' succesfully applied MLD'
             call put_var_adc(ncid, NB_id, NB_ADC, start(2:3), &
                              kount(2:3))
+            write(6,*) 'PROC',myProc,' succesfully applied NB'
             call put_var_adc(ncid, NM_id, NM_ADC, start(2:3), &
                              kount(2:3))
+            write(6,*) 'PROC',myProc,' succesfully applied NM'
          ENDIF
          call check_err(nf90_close(ncid))
       else
