@@ -41,7 +41,8 @@
       real*8,parameter :: BPGlim = 0.1d0 !upper/lower bound for BPGs
       real*8,parameter :: LatUL = 89d0 !upper limit for Lat in haversine 
       real*8,allocatable,dimension(:) :: BC3D_Lon, BC3D_Lat, BC3D_Z
-      real(sz),allocatable,dimension(:,:,:) :: BC3D_SP, BC3D_T, BC3D_BCP
+      real(sz),allocatable,dimension(:,:,:) :: BC3D_SP, BC3D_T,        &
+                                               BC3D_BCP
       real(sz),allocatable,dimension(:,:) :: BC2D_NM, BC2D_NB, BC2D_BX,&
                                 BC2D_SigTS, BC2D_BY, BC2D_MLD, BC2D_CD,&
                                 BC2D_DispX, BC2D_DispY, BC2D_KE
@@ -83,9 +84,17 @@
 !     Elemental derivatives of basis functions
       REAL*8,ALLOCATABLE,DIMENSION(:) :: Dphi1Dx, Dphi2Dx, Dphi3Dx, &
                                          Dphi1Dy, Dphi2Dy, Dphi3Dy
-!     Area-averaged nodal derivatives
+!     Intermediate values needed for calculating depth-averaged terms
+!     namely baroclinic pressures, depth-resolved HYCOM velocities on 
+!     ADCIRC grid and depth-averaged HYCOM velocities on adcirc grid
+      REAL*8,ALLOCATABLE,DIMENSION(:,:) :: BCP_ADC, ADC3D_U, ADC3D_V
+      REAL*8,ALLOCATABLE,DIMENSION(:) :: ADC2D_U, ADC2D_V
+!     Depth integrated stuff for mom disp (Duu, Duv, Dvv)
+      REAL*8,ALLOCATABLE,DIMENSION(:) :: DUU_ADC, DVV_ADC, DUV_ADC
+!     Baroclinic pressure gradients for output
       REAL*8,ALLOCATABLE,DIMENSION(:) :: BPG_ADCx, BPG_ADCy
-      REAL*8,ALLOCATABLE,DIMENSION(:,:) :: bcp_adc
+!     Momentum dispersion on adcirc grid for output
+      REAL*8,ALLOCATABLE,DIMENSION(:) :: DispX_ADC, DispY_Adc
 !     Other output variables
       REAL*8,ALLOCATABLE,DIMENSION(:) :: NB_ADC, NM_ADC, SigTS_ADC,&
                                          MLD_ADC
@@ -109,10 +118,7 @@
       if (prevProc.lt.0) prevProc = mnProc - 1    
  
 !.......Read the Control File
-      call cpu_time(start)
       call Read_Input_File() 
-      call cpu_time(finish)
-      write(6,*) 'reading input took ',finish-start,' seconds'
 !.......Start the download and process loop
       call OGCM_Run()
   
@@ -154,15 +160,22 @@
             write(6,*) 'INFO: Compute & output all T and S variables'
          elseif (OutType == 2) then
             write(6,*) 'INFO: Compute & output T, S, U, V'
-         ELSEIF ( OutType.EQ.3 ) THEN
-            ! calculate ALL variables on ADCIRC grid
-            WRITE(6,*) 'INFO: Compute & output T, S, U, V variables ' &
-                       //'on ADCIRC grid'
+         ELSEIF ( OutType.GE.3 ) THEN
+            IF (OutType.EQ.3) THEN
+               ! calculate ALL variables on ADCIRC grid
+               WRITE(6,*) 'INFO: Compute & output T and S' &
+                        // ' variables on ADCIRC grid'
+            ELSEIF (OutType.EQ.4) THEN
+               ! calculate ALL variables on ADCIRC grid
+               WRITE(6,*) 'INFO: Compute & output T, S, U, and V' &
+                        // ' variables on ADCIRC grid'
+            ELSE
+               write(6,*) 'ERROR: Invalid OutType = ',OutType
+               call MPI_Finalize(ierr); stop
+            ENDIF
             READ(5,'(A40)') fort14; print *, 'fort.14 = ',fort14
             ! read in fort.14
             CALL Read_f14()
-            ! Build neighbor table
-            CALL Build_NeiTabEle()
             ! calculate both Areas and TotalArea
             CALL Calc_Areas()
             ! calculate dphi/dx, dphi/dy
@@ -236,6 +249,7 @@
       do while (EndCheck%total_seconds() >= 0)
          !call cpu_time(start)
          IF (OutType.LT.3) THEN
+            ! output on native hycom grid
             do ii = 1,max(OutType,1)
                ! Download new OGCM NetCDF file
                call BC3DDOWNLOAD(CurDT,ii,OKflag)            
@@ -245,14 +259,20 @@
                ! Calculate the new BC2D terms.
                call Calc_BC2D_Terms(ii)
             end do
-         ELSEIF (OutType.EQ.3) THEN
-            ! Download new OGCM NetCDF file
-            call BC3DDOWNLOAD(CurDT,1,OKflag)            
-            if (.not.OKflag) exit
-            ! Read the OGCM NetCDF file
-            call Read_BC3D_NetCDF(3)
-            ! Calculate the new BC2D terms.
-            call Calc_BC2D_Terms(3)
+         ELSEIF (OutType.GE.3) THEN
+            DO ii = 1,MAX(OutType-2,1) 
+               ! output on adcirc grid
+               ! Download new OGCM NetCDF file
+               call BC3DDOWNLOAD(CurDT,ii,OKflag)            
+               IF (.NOT.OKflag) then
+                  WRITE(6,*) 'Issue with downloading '
+                  exit
+               ENDIF
+               ! Read the OGCM NetCDF file
+               call Read_BC3D_NetCDF(ii + 2)
+               ! Calculate the new BC2D terms.
+               call Calc_BC2D_Terms(ii + 2)
+            ENDDO
          ENDIF
          ! Put new BC2D terms in netCDF output file
          call UpdateNetCDF(IT,OKflag)
@@ -303,6 +323,12 @@
           BC3D_SP = read_nc_var(NC_ID,'salinity  ',1)
           ! Temperature 
           BC3D_T  = read_nc_var(NC_ID,'water_temp',1)
+        case(4) ! Velocity
+          write(6,*) myProc,'Processing U & V (ADCIRC grid)'
+          ! East-West velocity
+          BC3D_SP = read_nc_var(NC_ID,'water_u   ',1)
+          ! North-South Velocity
+          BC3D_T  = read_nc_var(NC_ID,'water_v   ',1)
       end select
 
       ! Close NETCDF
@@ -1014,14 +1040,16 @@
 !!$omp end do
 !!$omp end parallel
       CASE(3)
-      ! CPB: calculate values on the ADCIRC mesh
-      CALL Calc_BC2D_ADCIRC()
+      ! CPB: calculate T and S values on the ADCIRC mesh
+         CALL Calc_BC2D_TS_ADCIRC()
+      CASE(4)
+         CALL Calc_BC2D_UV_ADCIRC()
       end select
 !-----------------------------------------------------------------------
       end subroutine Calc_BC2D_Terms
 !-----------------------------------------------------------------------
 !-----------------------------------------------------------------------
-!     S U B R O U T I N E  C A L C _ B C 2 D _ A D C I R C
+!     S U B R O U T I N E  C A L C _ B C 2 D _ T S _ A D C I R C
 !-----------------------------------------------------------------------
 !     This subroutine takes the salinity and temperature read from GOFS
 !     data and:
@@ -1038,7 +1066,7 @@
 !           over the depth and depth average using the shallowest depth
 !           from the element (BC2D_BPGXe. 
 !-----------------------------------------------------------------------
-      SUBROUTINE Calc_BC2D_ADCIRC()
+      SUBROUTINE Calc_BC2D_TS_ADCIRC()
       IMPLICIT NONE
       REAL*8 :: RHO, RHOAVG, DZ
       REAL*8 :: SA(NZ), CT(NZ), LAT(NZ), N2(NZ-1), ZMID(NZ-1)!,&
@@ -1058,9 +1086,9 @@
       IF (FirstCall) THEN
          ALLOCATE( BPG_ADCx(NP), BPG_ADCy(NP), SigTS_ADC(NP),&
                    NB_ADC(NP), NM_ADC(NP), MLD_ADC(NP) ) 
-         ALLOCATE( bcp_adc(NZ,NP) )
          FirstCall = .FALSE.
       ENDIF
+      ALLOCATE( BCP_ADC(NZ,NP) )
       ! reset all values to 0
       BPG_ADCx  = 0d0
       BPG_ADCy  = 0d0
@@ -1076,6 +1104,7 @@
          ! save lat and lon as yy,xx for readability
          xx = SLAM(IP)
          IF (minval(BC3D_Lon).GE.0d0.AND.xx.lt.0d0) xx = xx + 360d0
+
          yy = SFEA(IP)
          ! get max depth we are using
          idzmax = INDZ(IP)
@@ -1245,8 +1274,200 @@
             BPG_ADCy(IP) = 0d0
          ENDIF
       ENDDO 
+      DEALLOCATE( BCP_ADC )
 !-----------------------------------------------------------------------
-      END SUBROUTINE Calc_BC2D_ADCIRC
+      END SUBROUTINE Calc_BC2D_TS_ADCIRC
+!-----------------------------------------------------------------------
+!-----------------------------------------------------------------------
+!     S U B R O U T I N E  C A L C _ B C 2 D _ U V _ A D C I R C
+!-----------------------------------------------------------------------
+!     This subroutine takes the u-velocity and v-velocity read from GOFS
+!     data and:
+!        1) Interpolates the velocities to the ADCIRC grid in both 
+!           depth-resolving and depth-averaged form
+!        2) Calculates momentum dispersion on the ADCIRC grid in the
+!           manner described in the ADCIRC theory and formulation report
+!-----------------------------------------------------------------------
+      SUBROUTINE Calc_BC2D_UV_ADCIRC()
+      IMPLICIT NONE
+      REAL*8 :: UU, UUAVG, VV, VVAVG, DZ
+      REAL*8 :: Udiff, Udiffavg, Vdiff, Vdiffavg
+      REAL(SZ) :: FV = -3D4, FVP = -3D4 + 1D-3, VS = 1D-3 
+      ! persistent logical for if we are on the first call
+      LOGICAL,SAVE :: FirstCall = .TRUE.
+      ! looping variables for do loops
+      INTEGER :: IP, IE, iz, idzmax, truebottom, NM1, NM2, NM3
+      ! for interpolating velocities
+      REAL*8 :: u1, u2, u3, u4, v1, v2, v3, v4
+      ! for calculating momentum dispersion
+      REAL*8 :: ddx1, ddx2, ddx3, ddy1, ddy2, ddy3, DUUx, DVVy,&
+                DUVx, DUVy
+      ! allocate output arrays if on the first call
+      IF (FirstCall) THEN
+         ALLOCATE( DispX_ADC(NP), DispY_ADC(NP) ) 
+         FirstCall = .FALSE.
+      ENDIF
+      ! allocate what we need to the math in this subroutine
+      ALLOCATE( ADC3D_U(NZ,NP), ADC3D_V(NZ,NP), &
+                ADC2D_U(NP),    ADC2D_V(NP),    &
+                DUU_ADC(NP),    DVV_ADC(NP),   &
+                DUV_ADC(NP) )
+      ! set errythign to 0
+      DispX_ADC = 0d0
+      DispY_ADC = 0d0
+      ADC3D_U = 0d0
+      ADC3D_V = 0d0
+      ADC2D_U = 0d0
+      ADC2D_V = 0d0
+      DUU_ADC = 0d0
+      DVV_ADC = 0d0
+      DUV_ADC = 0d0
+      !
+      ! interpolate hycom velocities to adcirc grid and find
+      ! depth-averaged hycom velocities on adcirc grid
+      !
+      DO IP = 1,NP
+         ! find predetermined max depth index
+         idzmax = INDZ(IP)
+         ! if we are too shallow skip
+         IF ( idzmax.LT.2 ) CYCLE
+         ! in case there is a bathy mismatch
+         truebottom = 0
+         DO iz = 1,idzmax
+            ! store individual values for readability
+            ! u-velocity
+            u1 = BC3D_SP(INDXY(1,IP),INDXY(2,IP),iz)
+            u2 = BC3D_SP(INDXY(3,IP),INDXY(2,IP),iz)
+            u3 = BC3D_SP(INDXY(1,IP),INDXY(4,IP),iz)
+            u4 = BC3D_SP(INDXY(3,IP),INDXY(4,IP),iz)
+            ! v-velocity
+            v1  = BC3D_T(INDXY(1,IP),INDXY(2,IP),iz)
+            v2  = BC3D_T(INDXY(3,IP),INDXY(2,IP),iz)
+            v3  = BC3D_T(INDXY(1,IP),INDXY(4,IP),iz)
+            v4  = BC3D_T(INDXY(3,IP),INDXY(4,IP),iz)
+            ! if we have any fill values we have hit the bottom
+            IF (u1.LT.FVP .OR. u2.LT.FVP .OR.&
+                u3.LT.FVP .OR. u4.LT.FVP .OR.&
+                v1.LT.FVP .OR. v2.LT.FVP .OR.&
+                v3.LT.FVP .OR. v4.LT.FVP) THEN
+               ADC3D_U(iz,IP) = FV
+               ADC3D_V(iz,IP) = FV
+            ELSE
+               ! grab previous timestep for trapezoidal ule
+               IF (iz.GT.1) THEN
+                  UUAVG = UU
+                  VVAVG = VV
+               ENDIF
+               UU = u1*WEIGHTS(1,IP) + u2*WEIGHTS(2,IP) +&
+                    u3*WEIGHTS(3,IP) + u4*WEIGHTS(4,IP)
+               VV = v1*WEIGHTS(1,IP) + v2*WEIGHTS(2,IP) +&
+                    v3*WEIGHTS(3,IP) + v4*WEIGHTS(4,IP)
+               ! save these values
+               ADC3D_U(iz,IP) = UU
+               ADC3D_V(iz,IP) = VV
+               IF (iz.GT.1) THEN
+                  UUAVG = 0.5d0*(UUAVG + UU)
+                  VVAVG = 0.5d0*(VVAVG + VV)
+                  dz = BC3D_Z(iz) - BC3D_Z(iz-1)
+                  ADC2D_U(IP) = ADC2D_U(IP) + dz*UUAVG
+                  ADC2D_V(IP) = ADC2D_V(IP) + dz*VVAVG
+               ENDIF
+               truebottom = iz
+            ENDIF
+         ENDDO
+         ! depth average the velocities
+         ADC2D_U(IP) = ADC2D_U(IP)/BC3D_Z(truebottom)
+         ADC2D_V(IP) = ADC2D_V(IP)/BC3D_Z(truebottom)
+      ENDDO
+      !
+      ! loop through again to calculate Duu, Dvv, Duv
+      !
+      DO IP = 1,NP
+         ! find predetermined max depth index
+         idzmax = INDZ(IP)
+         ! if we are too shallow skip
+         IF ( idzmax.LT.2 ) CYCLE
+         ! in case there is a bathy mismatch
+         truebottom = 0
+         DO iz = 1,idzmax
+            ! save previous vdiff, udiff for trapezoidal rule
+            IF (iz.GT.1) THEN
+               Udiffavg = Udiff
+               Vdiffavg = Vdiff
+            ENDIF
+            ! if we hit the bottom exit this loop
+            IF (ADC3D_U(iz,IP).LT.FVP .OR. ADC3D_V(iz,IP).LT.FVP) THEN
+               EXIT
+            ENDIF
+            ! find Udiff, Vdiff
+            Udiff = ADC3D_U(iz,IP) - ADC2D_U(IP)
+            Vdiff = ADC3D_V(iz,IP) - ADC2D_V(IP)
+            ! integrate
+            IF (iz.GT.1) THEN
+               dz = BC3D_Z(iz) - BC3D_Z(iz-1)
+               Udiffavg = 0.5d0*(Udiff+Udiffavg)
+               Vdiffavg = 0.5d0*(Vdiff+Vdiffavg)
+               DUU_ADC(IP) = DUU_ADC(IP) + Udiffavg*Udiffavg*dz
+               DVV_ADC(IP) = DVV_ADC(IP) + Vdiffavg*Vdiffavg*dz
+               DUV_ADC(IP) = DUV_ADC(IP) + Udiffavg*Vdiffavg*dz
+            ENDIF
+            truebottom = iz
+         ENDDO
+         ! depth average the velocities
+         ADC2D_U(IP) = ADC2D_U(IP)/BC3D_Z(truebottom)
+         ADC2D_V(IP) = ADC2D_V(IP)/BC3D_Z(truebottom)
+      ENDDO
+      !
+      ! Calculate momentum dispersion
+      !
+      DO IE = 1,NE
+         NM1 = NM(IE,1)
+         NM2 = NM(IE,2)
+         NM3 = NM(IE,3)
+         ddx1 = Dphi1Dx(IE)
+         ddx2 = Dphi2Dx(IE)
+         ddx3 = Dphi3Dx(IE)
+         ddy1 = Dphi1Dy(IE)
+         ddy2 = Dphi2Dy(IE)
+         ddy3 = Dphi3Dy(IE)
+         ! calculate this element's derivatives
+         DUUx = DUU_ADC(NM1)*ddx1 +&
+                DUU_ADC(NM2)*ddx2 +&
+                DUU_ADC(NM3)*ddx3
+         DVVy = DVV_ADC(NM1)*ddy1 +&
+                DVV_ADC(NM2)*ddy2 +&
+                DVV_ADC(NM3)*ddy3
+         DUVx = DUV_ADC(NM1)*ddx1 +&
+                DUV_ADC(NM2)*ddx2 +&
+                DUV_ADC(NM3)*ddx3
+         DUVy = DUV_ADC(NM1)*ddy1 +&
+                DUV_ADC(NM2)*ddy2 +&
+                DUV_ADC(NM3)*ddy3
+        ! add this elements contribution to each node
+        DispX_ADC(NM1) = DispX_ADC(NM1) + (DUUx+DUVy)*AREAS(IE)
+        DispX_ADC(NM2) = DispX_ADC(NM2) + (DUUx+DUVy)*AREAS(IE)
+        DispX_ADC(NM2) = DispX_ADC(NM2) + (DUUx+DUVy)*AREAS(IE)
+        DispY_ADC(NM1) = DispY_ADC(NM1) + (DUVx+DVVy)*AREAS(IE)
+        DispY_ADC(NM2) = DispY_ADC(NM2) + (DUVx+DVVy)*AREAS(IE)
+        DispY_ADC(NM2) = DispY_ADC(NM2) + (DUVx+DVVy)*AREAS(IE)
+      ENDDO
+      !
+      ! depth average
+      !
+      DO IP = 1,NP
+         IF (DP(IP).GT.1d-3) THEN
+            DispX_ADC(IP) = DispX_ADC(IP)/DP(IP)
+            DispY_ADC(IP) = DispY_ADC(IP)/DP(IP)
+         ELSE
+            DispX_ADC(IP) = 0d0
+            DispY_ADC(IP) = 0d0
+         ENDIF
+      ENDDO
+      ! for memory management deallocate this stuff
+      DEALLOCATE( ADC3D_U, ADC3D_V, ADC2D_U, ADC2D_V, &
+                  DUU_ADC, DVV_ADC, DUV_ADC )
+!-----------------------------------------------------------------------
+      END SUBROUTINE Calc_BC2D_UV_ADCIRC
 !-----------------------------------------------------------------------
       function haversine(deglon1,deglon2,deglat1,deglat2) result (dist)
           ! great circle distance -- adapted from Matlab 
@@ -1502,6 +1723,17 @@
       call def_var_att(ncid,'NM',nf90_type, data_dims(1:2), NM_id, &
                       'depth-averaged buoyancy frequency','s^-1')
       !
+      ! define momentum dispersion if appropriate
+      !
+      IF (OutType.GT.3) THEN
+         call def_var_att(ncid,'DispX',nf90_type, data_dims(1:2),&
+                          DispX_id, &
+                         'depth-averaged x-momentum dispersion','ms^-2')
+         call def_var_att(ncid,'DispY',nf90_type, data_dims(1:2),&
+                          DispY_id, &
+                         'depth-averaged x-momentum dispersion','ms^-2')
+      ENDIF
+      !
       ! Allowing vars to deflate
       !
       call check_err(nf90_def_var_deflate(ncid, lon_id, 1, 1, dfl))
@@ -1514,6 +1746,10 @@
       call check_err(nf90_def_var_deflate(ncid, MLD_id,  1,1,dfl))
       call check_err(nf90_def_var_deflate(ncid, NB_id, 1, 1, dfl))
       call check_err(nf90_def_var_deflate(ncid, NM_id, 1, 1, dfl))
+      IF (OutType.GT.3) THEN
+         call check_err(nf90_def_var_deflate(ncid, DispX_id, 1, 1, dfl))
+         call check_err(nf90_def_var_deflate(ncid, DispY_id, 1, 1, dfl))
+      ENDIF
       ! 
       ! put on mesh variables
       !
@@ -1610,7 +1846,7 @@
                call put_var(ncid, DispX_id, BC2D_DispX, start, kountYY)
                call put_var(ncid, DispY_id, BC2D_DispY, start, kountYY)
             endif
-         ELSEIF (OutType.EQ.3) THEN
+         ELSEIF (OutType.GE.3) THEN
             call put_var_adc(ncid, BPGX_id, BPG_ADCx, start(2:3), &
                          kount(2:3))
             write(6,*) 'PROC',myProc,' succesfully applied BPGX'
@@ -1629,6 +1865,13 @@
             call put_var_adc(ncid, NM_id, NM_ADC, start(2:3), &
                              kount(2:3))
             write(6,*) 'PROC',myProc,' succesfully applied NM'
+            IF (OutType.GT.3) THEN
+               call put_var_adc(ncid, DispX_id, DispX_ADC, start(2:3), &
+                                kount(2:3))
+               call put_var_adc(ncid, DispY_id, DispY_ADC, start(2:3), &
+                                kount(2:3))
+
+            ENDIF
          ENDIF
          call check_err(nf90_close(ncid))
       else
@@ -1715,63 +1958,6 @@
       WRITE(6,*) 'INFO: Successfully read fort.14 file'
 !
       end subroutine Read_F14
-!
-!-----------------------------------------------------------------------
-!     S U B R O U T I N E  C A L C _ M E S H _ V A L U E S
-!-----------------------------------------------------------------------
-!     CPB: using SFEA, SLAM, DP, and NM, this subroutine calculates and
-!     returns:
-!        - NeiTabEle(MNP,NEIMAX) 2D array of neighbor elements for each
-!          node
-!-----------------------------------------------------------------------
-      subroutine Build_NeiTabEle()
-      implicit none
-      logical :: Fexist
-      INTEGER :: errorio
-      ! looping variable
-      INTEGER :: ii
-      ! max number of elements attached to a node
-      INTEGER :: MNEI
-      ! counter for finding MNEI
-      INTEGER,ALLOCATABLE,DIMENSION(:) :: NEICOUNT
-      ! nodes 1, 2, 3 for an element
-      INTEGER :: NM1, NM2, NM3
-!
-      ! First loop through the connectivity table to find MNEI
-      ALLOCATE( NEICOUNT(NP) )
-      NEICOUNT = 0
-      DO ii = 1,NE
-         NM1 = NM(ii,1)
-         NM2 = NM(ii,2)
-         NM3 = NM(ii,3)
-         NEICOUNT(NM1) = NEICOUNT(NM1) + 1
-         NEICOUNT(NM2) = NEICOUNT(NM2) + 1
-         NEICOUNT(NM3) = NEICOUNT(NM3) + 1
-      ENDDO
-      MNEI = MAXVAL(NEICOUNT)
-      WRITE(6,*) 'max number of neighbors = ', MNEI
-      ! allocate neitabele now that we know how big it needs to be
-      ALLOCATE( NeiTabEle(NP,MNEI) ) 
-      NeiTabEle = 0
-      NEICOUNT = 0
-      ! now reset neicount to 0 and loop through to populate neitabele
-      DO ii = 1,NE
-         NM1 = NM(ii,1)
-         NM2 = NM(ii,2)
-         NM3 = NM(ii,3)
-         NEICOUNT(NM1) = NEICOUNT(NM1) + 1
-         NEICOUNT(NM2) = NEICOUNT(NM2) + 1
-         NEICOUNT(NM3) = NEICOUNT(NM3) + 1
-         NeiTabEle(NM1,NEICOUNT(NM1)) = ii
-         NeiTabEle(NM2,NEICOUNT(NM2)) = ii
-         NeiTabEle(NM3,NEICOUNT(NM3)) = ii
-      ENDDO
-      WRITE(6,*) 'INFO: Successfully built neighbor table'
-      DEALLOCATE( NEICOUNT )
-!
-      end subroutine Build_NeiTabEle
-!
-!
 !-----------------------------------------------------------------------
 !-----------------------------------------------------------------------
       SUBROUTINE Calc_Areas()
