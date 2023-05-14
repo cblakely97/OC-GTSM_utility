@@ -99,6 +99,18 @@
       REAL*8,ALLOCATABLE,DIMENSION(:) :: NB_ADC, NM_ADC, SigTS_ADC,&
                                          MLD_ADC
       REAL*8 :: start,finish
+!     Variables for NDCHL downloaded HYCOM files
+!     derived type to hold info read in from the ogcm file
+      TYPE :: OGCM_DATA
+         INTEGER :: NSNAPS
+         TYPE(DATETIME),ALLOCATABLE :: TSNAP(:)
+         CHARACTER(LEN=40),ALLOCATABLE :: TSFILE(:)
+         CHARACTER(LEN=40),ALLOCATABLE :: UVFILE(:)
+         CHARACTER(LEN=40),ALLOCATABLE :: SSHFILE(:)
+      END TYPE
+      TYPE(OGCM_DATA) :: FN
+      CHARACTER(LEN=16) :: OGCMFILE ! name of text file with OGCM info
+
 !-----------------------------------------------------------------------
 
 !.......Initialize MPI
@@ -119,6 +131,9 @@
  
 !.......Read the Control File
       call Read_Input_File() 
+!.....Read OGCM txt file with filenames (this is hardcoded for now)
+      OGCMFILE='ogcm_data.txt'
+      CALL READOGCMDATA(OGCMFILE)
 !.......Start the download and process loop
       call OGCM_Run()
   
@@ -196,7 +211,7 @@
       call MPI_Bcast(BCServer,3,MPI_Character,0,MPI_Comm_World,ierr)
       call MPI_Bcast(OutType,1,MPI_Integer,0,MPI_Comm_World,ierr)
       call MPI_Bcast(BC2D_Name,40,MPI_Character,0,MPI_Comm_World,ierr)
-      IF (OutType.EQ.3) THEN
+      IF (OutType.GE.3) THEN
          ! broadcast NP and NE
          CALL MPI_Bcast(NP,1,MPI_Integer,0,MPI_Comm_World,ierr)
          CALL MPI_Bcast(NE,1,MPI_Integer,0,MPI_Comm_World,ierr)
@@ -263,11 +278,24 @@
             DO ii = 1,MAX(OutType-2,1) 
                ! output on adcirc grid
                ! Download new OGCM NetCDF file
-               call BC3DDOWNLOAD(CurDT,ii,OKflag)            
-               IF (.NOT.OKflag) then
-                  WRITE(6,*) 'Issue with downloading '
-                  exit
-               ENDIF
+               !call BC3DDOWNLOAD(CurDT,ii,OKflag)            
+               !IF (.NOT.OKflag) then
+               !   WRITE(6,*) 'Issue with downloading '
+               !   IF (IT.EQ.0) THEN
+               !      WRITE(6,*) 'First timestep, can''t work'
+               !   ELSE
+               !      WRITE(6,*) 'Will use previous timestep data'
+               !      Okflag = .TRUE.
+               !   ENDIF
+               !   exit
+               !ENDIF
+               ! get the filename from our txt file from earlier (this
+               ! is also hardcoded for now)
+               CALL GETOGCMFILE(ii,CurDT,BC3D_Name)
+               OKflag = .true.
+               WRITE(6,*) 'BC3D_NAME = ',trim(BC3D_NAME)
+               BC3D_NAME = '/asclepius/cblakely/Datasets/HYCOM_data/'//&
+                           trim(BC3D_NAME)
                ! Read the OGCM NetCDF file
                call Read_BC3D_NetCDF(ii + 2)
                ! Calculate the new BC2D terms.
@@ -376,23 +404,27 @@
          ENDIF
          ! test if we are still in the same lon coordinates (-180/180
          ! or 0/360)
-         !write(6,*) 'inquiring lon name'
+         write(6,*) 'inquiring lon name'
          call Check_err(NF90_INQ_VARID(NC_ID,'lon',Temp_ID))
-         !write(6,*) 'inquiring lon dimension'
+         write(6,*) 'inquiring lon dimension'
          !Call Check_err(NF90_INQUIRE_DIMENSION(NC_ID,Temp_ID,&
          !               len=NY_temp))
-         !write(6,*) 'NX_temp = ',ny_temp
-         !write(6,*) 'NX = ',NX
+         write(6,*) 'NX_temp = ',ny_temp
+         write(6,*) 'NX = ',NX
          ALLOCATE( templon(NX) )
          call Check_err(NF90_INQ_VARID(NC_ID,'lon',Temp_ID))
          !write(6,*) 'reading in templon'
          call Check_err(NF90_GET_VAR(NC_ID,Temp_ID,templon))
-         IF (minval(templon).ne.minval(BC3D_Lon)) THEN
-            write(6,*) 'INFO: we have switched grids, recalculating'&
-                       //' interpolation weights.'
-            ! deallocate all values we get from the input data
-            DEALLOCATE( BC3D_Lat, BC3D_Lon, BC3D_Z, BC3D_SP, BC3D_T )
-            FirstCall = .True.
+         write(6,*) 'templon: ',minval(templon)
+         IF (ALLOCATED(BC3D_LON)) THEN
+            write(6,*) 'bc3d_lon: ',minval(BC3D_Lon)
+            IF (minval(templon).ne.minval(BC3D_Lon)) THEN
+               write(6,*) 'INFO: we have switched grids, recalculating'&
+                          //' interpolation weights.'
+               ! deallocate all values we get from the input data
+               DEALLOCATE( BC3D_Lat, BC3D_Lon, BC3D_Z, BC3D_SP, BC3D_T )
+               FirstCall = .True.
+            ENDIF
          ENDIF
          DEALLOCATE( templon )
       ENDIF
@@ -452,7 +484,7 @@
          ENDIF
          ! If we are outputting to ADCIRC grid just put this all in
          ! 0-360 coordinates 
-         IF (OutType.EQ.3) THEN
+         IF (OutType.GE.3) THEN
             DO i = 1,NY
                !IF (BC3D_Lon(i).lt.0d0) THEN
                !   BC3D_Lon(i) = BC3D_Lon(i) + 360d0
@@ -518,12 +550,12 @@
 !-----------------------------------------------------------------------
       subroutine check_err(iret)
       implicit none
-
+      REAL*8,ALLOCATABLE,DIMENSION(:) :: test
       integer, intent(in) :: iret
-      
 
       if (iret .ne. nf90_noerr) then
          write(6,*) 'netcdf check_err error' 
+         test(1) = 0d0
          call MPI_Abort(MPI_Comm_World,iret,ierr)
       endif
 !-----------------------------------------------------------------------
@@ -548,7 +580,7 @@
       character(len=5)   :: command 
       integer            :: iter, stat, fid, resINT, &
                             mpistat(mpi_status_size)
-      integer*8          :: Fsize, FSizeTrue 
+      integer*8          :: Fsize, FSizeTrue,file_exists
        
       ! OKflag is false by default    
       OKflag = .false.
@@ -592,13 +624,13 @@
          options    = ' -s --connect-timeout 30'
       elseif (BCServer == 'ncs') then
          ! NCSS
-         fileserver = '"http://ncss.hycom.org/thredds/ncss/GLBy0.08/'
+         fileserver = '"http://ncss.hycom.org/thredds/ncss/GLBv0.08/'
          command    = 'curl '
          options    = ' -s --connect-timeout 30'
       elseif (BCServer == 'opd') then
          ! OpenDap
          command    = 'ncks '
-         fileserver = '"http://tds.hycom.org/thredds/dodsC/GLBy0.08/'
+         fileserver = '"http://tds.hycom.org/thredds/dodsC/GLBv0.08/'
          options    = ' -4 -O '
       endif
       if (TimeOff%getYear().ge.2018) then
@@ -723,6 +755,7 @@
       ! Get the final path
       Fullpath = trim(fileserver)//trim(expt)//trim(vars)       &
                //trim(filemid)//trim(times)//trim(fileend) 
+      WRITE(6,*) Fullpath
       ! Let's get expected filesize
       if (BCServer == 'ftp') then
          FSizeTrue = 0; 
@@ -736,7 +769,7 @@
             endif
             open(newunit=fid,                                     &
                  file='filesize'//trim(adjustl(hhh))//'.txt',     &
-                 status='old',action='read')
+                 status='old',action='read',IOSTAT=file_exists)
                do ! read until eof
                   read(fid,'(A280)',iostat=stat) line
                   if (stat.ne.0) exit
@@ -745,7 +778,7 @@
                      exit
                   endif
                enddo
-            close(fid)
+            close(fid,STATUS='DELETE')
             if (FSizeTrue.eq.0) then
                ! Non-existant file. 
                ! Try forecast
@@ -1218,6 +1251,8 @@
          ! reset bpgx and bpgy to 0
          bpgx = 0d0
          bpgy = 0d0
+         bx = 0d0
+         by = 0d0
          ! only calculate if we are deep enough
          IF (idzmax.gt.0) THEN
             DO iz = 1,idzmax
@@ -1376,8 +1411,13 @@
             ENDIF
          ENDDO
          ! depth average the velocities
-         ADC2D_U(IP) = ADC2D_U(IP)/BC3D_Z(truebottom)
-         ADC2D_V(IP) = ADC2D_V(IP)/BC3D_Z(truebottom)
+         IF (truebottom.GT.1) THEN
+            ADC2D_U(IP) = ADC2D_U(IP)/BC3D_Z(truebottom)
+            ADC2D_V(IP) = ADC2D_V(IP)/BC3D_Z(truebottom)
+         ELSE
+            ADC2D_U(IP) = 0d0
+            ADC2D_V(IP) = 0d0
+         ENDIF
       ENDDO
       !
       ! loop through again to calculate Duu, Dvv, Duv
@@ -1388,7 +1428,6 @@
          ! if we are too shallow skip
          IF ( idzmax.LT.2 ) CYCLE
          ! in case there is a bathy mismatch
-         truebottom = 0
          DO iz = 1,idzmax
             ! save previous vdiff, udiff for trapezoidal rule
             IF (iz.GT.1) THEN
@@ -1411,11 +1450,7 @@
                DVV_ADC(IP) = DVV_ADC(IP) + Vdiffavg*Vdiffavg*dz
                DUV_ADC(IP) = DUV_ADC(IP) + Udiffavg*Vdiffavg*dz
             ENDIF
-            truebottom = iz
          ENDDO
-         ! depth average the velocities
-         ADC2D_U(IP) = ADC2D_U(IP)/BC3D_Z(truebottom)
-         ADC2D_V(IP) = ADC2D_V(IP)/BC3D_Z(truebottom)
       ENDDO
       !
       ! Calculate momentum dispersion
@@ -1456,8 +1491,8 @@
       !
       DO IP = 1,NP
          IF (DP(IP).GT.1d-3) THEN
-            DispX_ADC(IP) = DispX_ADC(IP)/DP(IP)
-            DispY_ADC(IP) = DispY_ADC(IP)/DP(IP)
+            DispX_ADC(IP) = DispX_ADC(IP)/DP(IP)/TotalArea(IP)
+            DispY_ADC(IP) = DispY_ADC(IP)/DP(IP)/TotalArea(IP)
          ELSE
             DispX_ADC(IP) = 0d0
             DispY_ADC(IP) = 0d0
@@ -1614,7 +1649,7 @@
          if (OutType.eq.2) &
             call check_err(nf90_put_var(ncid, lats_id,BC3D_Lat(2:NY-1)))
          call check_err(nf90_close(ncid))
-      ELSEIF ( .not.Fexist.AND.OutType.Eq.3 ) THEN
+      ELSEIF ( .not.Fexist.AND.OutType.GE.3 ) THEN
          CALL initNetCDF_adc()
       endif
       ! Barrier to ensure wait until netcdf is created by first
@@ -1645,9 +1680,9 @@
          endif
          call check_err(nf90_inq_varid(ncid,'NB', NB_id))    
          call check_err(nf90_inq_varid(ncid,'NM', NM_id))
-         if (OutType.eq.2) then
-            call check_err(nf90_inq_varid(ncid,'KE', KE_id))
-            call check_err(nf90_inq_varid(ncid,'CDisp', CD_id))
+         if (OutType.eq.2.OR.OutType.EQ.4) then
+            !call check_err(nf90_inq_varid(ncid,'KE', KE_id))
+            !call check_err(nf90_inq_varid(ncid,'CDisp', CD_id))
             call check_err(nf90_inq_varid(ncid,'DispX', DispX_id))
             call check_err(nf90_inq_varid(ncid,'DispY', DispY_id))
          endif
@@ -2555,6 +2590,72 @@
           binarysearch = right
       END FUNCTION binarysearch
 !-----------------------------------------------------------------------
+!----------------------------------------------------------------------
+      SUBROUTINE GETOGCMFILE(flag,TimeIn,FileOut)
+!----------------------------------------------------------------------
+!     This subroutine returns the name of the file we want for a
+!     particular input time (timein) and flag. If flag = 1 then we
+!     want the temperature and salinity file. If flag = 2 then we want
+!     the velocity file. It returns a string "fileout"
+!----------------------------------------------------------------------
+      IMPLICIT NONE
+      INTEGER,INTENT(IN) :: FLAG
+      TYPE(DATETIME),INTENT(IN) :: TimeIn
+      CHARACTER(LEN=80),INTENT(OUT) :: FileOut
+      INTEGER :: kk
+      ! check the bounds first
+      IF ( TIMEIN.LT.FN%TSNAP(1) .OR.&
+           TIMEIN.GT.FN%TSNAP(FN%NSNAPS) ) THEN
+         WRITE(6,*) 'ERROR: This time is not available.'
+         CALL ABORT
+      ENDIF
+      DO kk = 1,FN%NSNAPS-1
+         IF ( TIMEIN.GE.FN%TSNAP(kk) .AND.&
+              TIMEIN.LT.FN%TSNAP(kk+1) ) THEN
+            EXIT
+         ENDIF
+      ENDDO
+      IF ( FLAG.EQ.1 ) THEN
+         FileOut = FN%TSFILE(kk)
+      ELSEIF ( FLAG.EQ.2 ) THEN
+         FileOut = FN%UVFILE(kk)
+      ENDIF
+!----------------------------------------------------------------------
+      END SUBROUTINE GETOGCMFILE
+!----------------------------------------------------------------------
+!----------------------------------------------------------------------
+      SUBROUTINE READOGCMDATA(OGCMFILE)
+!----------------------------------------------------------------------
+!     This subroutine reads the text file "OGCMFILE" that contains 
+!     the timesnaps and filenames that we want. It is structured as:
+!
+!             nTimeSnaps
+!             TSNAP1, TSFILE1, UVFILE1, SSHFILE1
+!             TSNAP2, TSFILE2, UVFILE2, SSHFILE2
+!             ...
+!             TSNAPnTimeSnaps, TSFILEnTimeSnaps,...
+!----------------------------------------------------------------------
+      IMPLICIT NONE
+      CHARACTER(LEN=16),INTENT(IN) :: OGCMFILE
+      INTEGER :: nsnaps, kk
+      CHARACTER(len=16) :: tsnap ! dummy string b4 datetime conv
+      CHARACTER(LEN=40) :: file1,file2,file3
+      OPEN(12,file=OGCMFILE,status='old')
+      READ(12,*) nsnaps
+      FN%NSNAPS=nsnaps
+      ALLOCATE( FN%TSNAP(nsnaps), FN%TSFILE(nsnaps),&
+                FN%UVFILE(nsnaps), FN%SSHFILE(nsnaps) )
+      DO kk = 1,nsnaps
+         READ(12,*) tsnap, file1, file2, file3
+         FN%TSNAP(kk) = STRPTIME(trim(tsnap),"%Y-%m-%d %H:%M")
+         FN%TSFILE(kk) = trim(file1)
+         FN%UVFILE(kk) = trim(file2)
+         FN%SSHFILE(kk) = trim(file3)
+      ENDDO
+      CLOSE(12)
+!----------------------------------------------------------------------
+      END SUBROUTINE READOGCMDATA
+!----------------------------------------------------------------------
 !-----------------------------------------------------------------------
       END PROGRAM OGCM_DL
 !-----------------------------------------------------------------------
