@@ -7,7 +7,7 @@
       use MPI
       use netcdf
       use gsw_mod_toolbox, only: gsw_SA_from_SP, gsw_rho, gsw_CT_from_t&
-          , gsw_Nsquared, gsw_mlp
+          , gsw_Nsquared, gsw_mlp, gsw_geo_strf_dyn_height
       implicit none
 !     This program downloads OGCM data (e.g. GOFS 3.1 HYCOM), and computes  
 !     depth-averaged baroclinic pressure gradients, buoyancy frequencies, 
@@ -62,7 +62,7 @@
               SigTS_id, BPGX_id, BPGY_id, NB_id, lon_id, lat_id, KE_id,&
               latc_id, lats_id, lonc_id, strlen_dim_id, DispX_id, &
               DispY_id, depth_id, ele_id, node_dim_id, nele_dim_id, &
-              nvertex_dim_id
+              nvertex_dim_id, BCSL_id
 !     CPB: Variables for outputting on ADCIRC grid. I did my best to
 !     make sure that variable names match what is in ADCIRC source code.
       CHARACTER(len=40) :: fort14 ! name of fort.14 grid file
@@ -97,7 +97,7 @@
       REAL*8,ALLOCATABLE,DIMENSION(:) :: DispX_ADC, DispY_Adc
 !     Other output variables
       REAL*8,ALLOCATABLE,DIMENSION(:) :: NB_ADC, NM_ADC, SigTS_ADC,&
-                                         MLD_ADC
+                                         MLD_ADC, BCSL_ADC
       REAL*8 :: start,finish
 !     Variables for NDCHL downloaded HYCOM files
 !     derived type to hold info read in from the ogcm file
@@ -184,6 +184,10 @@
                ! calculate ALL variables on ADCIRC grid
                WRITE(6,*) 'INFO: Compute & output T, S, U, and V' &
                         // ' variables on ADCIRC grid'
+            ELSEIF (OutType.EQ.5) THEN
+               ! calculate ALL variables on ADCIRC grid
+               WRITE(6,*) 'INFO: Compute & output baroclinic sea' &
+                       //' level on ADCIRC grid'
             ELSE
                write(6,*) 'ERROR: Invalid OutType = ',OutType
                call MPI_Finalize(ierr); stop
@@ -274,6 +278,17 @@
                ! Calculate the new BC2D terms.
                call Calc_BC2D_Terms(ii)
             end do
+         ELSEIF (OutType.EQ.5) THEN
+            CALL GETOGCMFILE(1,CurDT,BC3D_Name)
+            OKflag = .true.
+            WRITE(6,*) 'BC3D_NAME = ',trim(BC3D_NAME)
+            BC3D_NAME = '/asclepius/cblakely/Datasets/HYCOM_data/'//&
+                        trim(BC3D_NAME)
+            ! Read the OGCM NetCDF file
+            call Read_BC3D_NetCDF(3)
+            ! Calculate the steric adjustment.
+            call Calc_Steric_Adjustment()
+            WRITE(6,*) "Calced BCSL for this time step"
          ELSEIF (OutType.GE.3) THEN
             DO ii = 1,MAX(OutType-2,1) 
                ! output on adcirc grid
@@ -1504,6 +1519,149 @@
 !-----------------------------------------------------------------------
       END SUBROUTINE Calc_BC2D_UV_ADCIRC
 !-----------------------------------------------------------------------
+!-----------------------------------------------------------------------
+!     S U B R O U T I N E  C A L C _ S T E R I C _ A D J U S T M E N T
+!-----------------------------------------------------------------------
+!     This subroutine takes the salinity and temperature read from GOFS
+!     data and:
+!        1) Converts from practical salinity to absolute salinity and
+!           from temperature to conservative temperature on the GOFS
+!           grid.
+!        2) Calculates dynamic height anomaly w.r.t the bottom for each
+!           ADCIRC node. 
+!        3) Calculates baroclinic pressure anomaly:
+!               P'(z) = P(z) - (1/D)\int_{-D}^{0}P(z)dz
+!        4) Estimates the baroclinc sea level (BCSL_ADC) for each node
+!-----------------------------------------------------------------------
+      SUBROUTINE Calc_Steric_Adjustment()
+      IMPLICIT NONE
+      REAL*8 :: RHO(NZ), RHOAVG, DZ, DHA_avg, dha_step
+      REAL*8 :: SA(NZ), CT(NZ), LAT(NZ), DHA(NZ)
+      REAL(SZ) :: FV = -3D4, FVP = -3D4 + 1D-3, VS = 1D-3 
+      ! persistent logical for if we are on the first call
+      LOGICAL,SAVE :: FirstCall = .TRUE.
+      ! looping variables for do loops
+      INTEGER :: IP, IE, iz, idzmax, truebottom, NM1, NM2, NM3
+      ! for calculating baroclinic pressures
+      REAL*8 :: xx, yy, sp1, sp2, sp3, sp4, t1, t2, t3, t4,&
+                sa1, sa2, sa3, sa4, ct1, ct2, ct3, ct4
+      ! allocate output arrays if on the first call
+      WRITE(6,*) "INFO: calculating BCSL"
+      IF (FirstCall) THEN
+         ALLOCATE( BCSL_ADC(NP) ) 
+         FirstCall = .FALSE.
+      ENDIF
+      ! reset all values to 0
+      BCSL_ADC(:)   = 0d0
+      !
+      ! get BCP_ADC, SigTS_ADC, NB_ADC, and NM_ADC
+      !
+      DO IP = 1,NP
+         ! save lat and lon as yy,xx for readability
+         xx = SLAM(IP)
+         IF (minval(BC3D_Lon).GE.0d0.AND.xx.lt.0d0) xx = xx + 360d0
+
+         yy = SFEA(IP)
+         ! get max depth we are using
+         idzmax = INDZ(IP)
+         ! if we are only at the surface skip this whole loop
+         IF (idzmax.lt.2) CYCLE
+         ! reset the variable to track if we are at the bottom to 0
+         truebottom = 0
+         ! for my sanity reset the arrays for SA and CT to 0
+         SA = 0d0
+         CT = 0d0
+         RHO = 0d0
+         ! we also need a latitude array for the buoyancy frequency profile
+         ! calculations
+         Lat = yy
+         DO iz = 1,idzmax
+            ! for readability save the salinity and temps as individual values
+            ! rather than using the indices
+            ! salinity
+            sp1 = BC3D_SP(INDXY(1,IP),INDXY(2,IP),iz)
+            sp2 = BC3D_SP(INDXY(3,IP),INDXY(2,IP),iz)
+            sp3 = BC3D_SP(INDXY(1,IP),INDXY(4,IP),iz)
+            sp4 = BC3D_SP(INDXY(3,IP),INDXY(4,IP),iz)
+            ! temperature
+            t1  = BC3D_T(INDXY(1,IP),INDXY(2,IP),iz)
+            t2  = BC3D_T(INDXY(3,IP),INDXY(2,IP),iz)
+            t3  = BC3D_T(INDXY(1,IP),INDXY(4,IP),iz)
+            t4  = BC3D_T(INDXY(3,IP),INDXY(4,IP),iz)
+            ! if any of these are a fill value then we have hit the bottom and
+            ! should use a fill value
+            IF (sp1.lt.FVP .OR. sp2.lt.FVP .OR.&
+                sp3.lt.FVP .OR. sp4.lt.FVP .OR.&
+                t1.lt.FVP  .OR. t2.lt.FVP .OR.&
+                t3.lt.FVP  .OR. t4.lt.FVP) THEN
+            ELSE
+               ! convert to absolute salinity
+               sa1 = gsw_SA_from_SP(max(2d0,sp1),BC3D_Z(iz),&
+                            BC3D_Lon(INDXY(1,IP)),BC3D_LAT(INDXY(2,IP)))
+               !
+               sa2 = gsw_SA_from_SP(max(2d0,sp2),BC3D_Z(iz),&
+                            BC3D_Lon(INDXY(3,IP)),BC3D_LAT(INDXY(2,IP)))
+               !
+               sa3 = gsw_SA_from_SP(max(2d0,sp3),BC3D_Z(iz),&
+                            BC3D_Lon(INDXY(1,IP)),BC3D_LAT(INDXY(4,IP)))
+               !
+               sa4 = gsw_SA_from_SP(max(2d0,sp4),BC3D_Z(iz),&
+                            BC3D_Lon(INDXY(3,IP)),BC3D_LAT(INDXY(4,IP)))
+               ! convert to conservative temperature
+               ct1 = gsw_CT_from_T(sa1,dble(t1),BC3D_Z(iz))
+               ct2 = gsw_CT_from_T(sa2,dble(t2),BC3D_Z(iz))
+               ct3 = gsw_CT_from_T(sa3,dble(t3),BC3D_Z(iz))
+               ct4 = gsw_CT_from_T(sa4,dble(t4),BC3D_Z(iz))
+               ! interpolate to our ADCIRC node
+               SA(iz) = sa1*WEIGHTS(1,IP) + sa2*WEIGHTS(2,IP) +&
+                        sa3*WEIGHTS(3,IP) + sa4*WEIGHTS(4,IP)
+               CT(iz) = ct1*WEIGHTS(1,IP) + ct2*WEIGHTS(2,IP) +&
+                        ct3*WEIGHTS(3,IP) + ct4*WEIGHTS(4,IP)
+               RHO(iz) = gsw_rho(SA(iz),CT(iz),BC3D_Z(iz))
+               truebottom = iz
+            ENDIF
+         ENDDO
+         ! if applicable get the dynamic height anomaly
+         IF (truebottom.GT.0) THEN
+            DHA(:) = 0d0
+            !DHA(1:truebottom) = gsw_geo_strf_dyn_height(&
+            !                    SA(1:truebottom), CT(1:truebottom),&
+            !                    BC3D_Z(1:truebottom), &
+            !                    BC3D_Z(truebottom))
+            DHA_avg = 0d0
+            DO iz = truebottom,1,-1
+               IF (iz.EQ.truebottom) THEN
+                  dha_step = RHO(iz)
+                  CYCLE
+               ENDIF
+               dha_step = (1d0/2d0)*(dha_step + (RHO(iz)))
+               DZ = BC3D_Z(iz+1) - BC3D_Z(iz)
+               DHA_avg = DHA_avg + dha_step*DZ*g
+               DHA(iz) = DHA_avg
+               dha_step = RHO(iz)
+            ENDDO
+            DHA_avg = 0d0
+            DO iz = truebottom,1,-1
+               IF (iz.EQ.truebottom) THEN
+                  dha_step = DHA(iz)
+                  cycle
+               ENDIF
+               dha_step = (1d0/2d0)*(dha_step + DHA(iz))
+               DZ = BC3D_Z(iz+1) - BC3D_Z(iz)
+               DHA_avg = DHA_avg + dha_step*DZ
+               dha_step = DHA(iz)
+            ENDDO
+            BCSL_adc(IP) = (DHA(1) - DHA_avg/BC3D_Z(truebottom))
+            BCSL_adc(IP) = BCSL_adc(IP)/(RhoWat0*g)
+            DHA_avg = DHA_avg/BC3D_Z(truebottom)
+            IF (BCSL_adc(IP).GT.1d5) THEN
+               BCSL_adc(IP) = 0
+            ENDIF
+         ENDIF
+      ENDDO
+!-----------------------------------------------------------------------
+      END SUBROUTINE Calc_Steric_Adjustment
+!-----------------------------------------------------------------------
       function haversine(deglon1,deglon2,deglat1,deglat2) result (dist)
           ! great circle distance -- adapted from Matlab 
           real*8,intent(in) :: deglat1,deglon1,deglat2,deglon2
@@ -1832,7 +1990,10 @@
       logical, intent(in) :: OKflag
       integer,dimension(3) :: start, kount, kountX, kountY, kountYY
       integer  :: startT, mpistat(mpi_status_size)
-    
+      IF (OutType.EQ.5) THEN
+         CALL writeBCSLNC(IT,OKflag)
+         return
+      ENDIF 
       ! Make netcdf/get dimension and variable IDs 
       write(6,*) 'IT = ',IT
       if (IT.eq.0) then 
@@ -1918,9 +2079,141 @@
          ! Telling next processor to start writing 
          call mpi_send(startT,1,mpi_integer,nextProc,0,&
                        MPI_Comm_World,ierr)
-      endif
- 
+      endif 
+!-----------------------------------------------------------------------
+!-----------------------------------------------------------------------
       end subroutine UpdateNetCDF
+!-----------------------------------------------------------------------
+!-----------------------------------------------------------------------
+!     S U B R O U T I N E    W R I T E B C S L N C
+!-----------------------------------------------------------------------
+!-----------------------------------------------------------------------
+      subroutine writeBCSLNC(IT,OKflag)
+      implicit none
+      integer, intent(in) :: IT
+      logical, intent(in) :: OKflag
+      integer,dimension(3) :: start, kount, kountX, kountY, kountYY
+      integer  :: startT, mpistat(mpi_status_size)
+      ! Make netcdf/get dimension and variable IDs 
+      write(6,*) 'IT = ',IT
+      if (IT.eq.0) then 
+         call initNetCDF_BCSL()
+         write(6,*)'PROC ',myproc,'initiated netcdf'
+      endif
+      kount = [1,NP,1]
+      if ( (IT > 0 .or. myProc > 0) .and. mnProc > 1) then
+         ! Receiving message from prev processor to start writing
+         call mpi_recv(startT,1,mpi_integer,prevProc,0,MPI_Comm_World,&
+                       mpistat,ierr)
+      endif
+
+      if (OKflag) then
+         if ((IT.eq.0.and.myProc.eq.0).or.mnProc.eq.1) then
+            startT = tsind + IT
+         else
+            startT = startT + 1
+         endif
+         start = [1, 1, startT];
+         write(6,*) 'UpdateNetCDF:',myProc,&
+                    CurDT%strftime("%Y-%m-%d %H:%M")
+         call check_err(nf90_open(BC2D_Name, nf90_write, ncid))
+         call check_err(nf90_put_var(ncid, timenc_id,    &
+                        CurDT%strftime("%Y-%m-%d %H:%M"),&
+                        [1, start(3)],[16, kount(3)]))
+         call put_var_adc(ncid, BCSL_id, BCSL_ADC, start(2:3), &
+                      kount(2:3))
+         call check_err(nf90_close(ncid))
+      else
+         write(6,*) 'Skipping Update of NetCDF:',&
+                     myProc,CurDT%strftime("%Y-%m-%d %H:%M")
+      endif
+
+      if (mnProc > 1) then
+         ! Telling next processor to start writing 
+         call mpi_send(startT,1,mpi_integer,nextProc,0,&
+                       MPI_Comm_World,ierr)
+      endif 
+!-----------------------------------------------------------------------
+!-----------------------------------------------------------------------
+      end subroutine writeBCSLNC
+!-----------------------------------------------------------------------
+!-----------------------------------------------------------------------
+!     S U B R O U T I N E    I N I T N E T C D F _ B C S L
+!-----------------------------------------------------------------------
+!-----------------------------------------------------------------------
+      subroutine initNetCDF_BCSL()
+      implicit none
+      logical :: Fexist 
+      integer :: ierr, data_dims(3), TEE 
+      type(timedelta) :: DT
+      type(datetime)  :: TNDT
+      character(len=16) :: TSS
+      !
+      ! print to screen for intormation
+      !
+      WRITE(6,*) 'INFO: initializing NetCDF for Baroclinic Sea Level'
+      !
+      ! Open file  
+      !
+      call check_err(nf90_create(BC2D_Name, ncformat, ncid))
+      !
+      ! Define dimensions
+      !
+      call check_err(nf90_def_dim(ncid, 'time', nf90_unlimited, &
+                     timenc_dim_id))
+      call check_err(nf90_def_dim(ncid, 'strlen', 16, strlen_dim_id))
+      call check_err(nf90_def_dim(ncid,'node',NP,node_dim_id))
+      call check_err(nf90_def_dim(ncid,'nele',NE,nele_dim_id))
+      call check_err(nf90_def_dim(ncid,'nvertex',3,nvertex_dim_id))
+      !
+      ! define variables
+      !
+      data_dims = [strlen_dim_id, timenc_dim_id, 1]
+      !
+      ! define time variable
+      !
+      call def_var_att(ncid,'time',nf90_char, data_dims(1:2), &
+                       timenc_id,'UTC datetime','YYYY-MM-DD HH:mm')
+      !
+      ! define mesh variables (x, y, element, b)
+      !
+      call def_var_att(ncid,'x',nf90_double, [node_dim_id], &
+                       lon_id,'longitude','degrees')
+      call def_var_att(ncid,'y',nf90_double, [node_dim_id], &
+                          lat_id,'latitude','degrees')
+      call def_var_att(ncid,'depth',nf90_double, [node_dim_id], &
+                          depth_id,'distance below geoid','m')
+      call def_var_att(ncid,'element',nf90_int,&
+                          [nele_dim_id, nvertex_dim_id], &
+                          ele_id,'element','nondimensional')
+      !
+      ! define calculated values
+      !
+      data_dims = [node_dim_id,timenc_dim_id,1]
+      call def_var_att(ncid,'BCSL',nf90_type, data_dims(1:2), BCSL_id, &
+                     'baroclinic sea level ','m')
+      !
+      ! Allowing vars to deflate
+      !
+      call check_err(nf90_def_var_deflate(ncid, lon_id, 1, 1, dfl))
+      call check_err(nf90_def_var_deflate(ncid, lat_id, 1, 1, dfl))
+      call check_err(nf90_def_var_deflate(ncid, depth_id, 1, 1, dfl))
+      call check_err(nf90_def_var_deflate(ncid, ele_id, 1, 1, dfl))
+      call check_err(nf90_def_var_deflate(ncid, BCSL_id, 1,1,dfl))
+      ! 
+      ! put on mesh variables
+      !
+      call check_err(nf90_put_var(ncid, lon_id, SLAM))
+      call check_err(nf90_put_var(ncid, lat_id, SFEA))
+      call check_err(nf90_put_var(ncid, depth_id, DP))
+      call check_err(nf90_put_var(ncid, ele_id, NM))
+      !
+      ! close file
+      !
+      call check_err(nf90_close(ncid))
+      end subroutine initNetCDF_BCSL
+!-----------------------------------------------------------------------
+!-----------------------------------------------------------------------
 !-----------------------------------------------------------------------
 !     S U B R O U T I N E    P U T _ V A R
 !-----------------------------------------------------------------------
@@ -2433,6 +2726,7 @@
       INTEGER :: indt(4)
       REAL*8 :: wt(4)
       ! allocate on first call
+      write(6,*) "getting interp weights"
       IF (FirstCall) THEN
          FirstCall = .FALSE.
          ALLOCATE( INDXY(4,NP), WEIGHTS(4,NP), INDZ(NP) )
