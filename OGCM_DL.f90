@@ -104,9 +104,9 @@
       TYPE :: OGCM_DATA
          INTEGER :: NSNAPS
          TYPE(DATETIME),ALLOCATABLE :: TSNAP(:)
-         CHARACTER(LEN=40),ALLOCATABLE :: TSFILE(:)
-         CHARACTER(LEN=40),ALLOCATABLE :: UVFILE(:)
-         CHARACTER(LEN=40),ALLOCATABLE :: SSHFILE(:)
+         CHARACTER(LEN=60),ALLOCATABLE :: TSFILE(:)
+         CHARACTER(LEN=60),ALLOCATABLE :: UVFILE(:)
+         CHARACTER(LEN=60),ALLOCATABLE :: SSHFILE(:)
       END TYPE
       TYPE(OGCM_DATA) :: FN
       CHARACTER(LEN=16) :: OGCMFILE ! name of text file with OGCM info
@@ -398,7 +398,7 @@
       ! the interpolants and continue outputting.
       IF (.NOT.FirstCall) THEN
          !WRITE(6,*) 'checking grid'
-         call Check_err(NF90_INQ_DIMID(NC_ID,'lat',Temp_ID))
+         call Check_err(NF90_INQ_DIMID(NC_ID,'Latitude',Temp_ID))
          !write(6,*) 'inquiring dim'
          Call Check_err(NF90_INQUIRE_DIMENSION(NC_ID,Temp_ID,&
                         len=NY_temp))
@@ -418,14 +418,14 @@
          ! test if we are still in the same lon coordinates (-180/180
          ! or 0/360)
          write(6,*) 'inquiring lon name'
-         call Check_err(NF90_INQ_VARID(NC_ID,'lon',Temp_ID))
+         call Check_err(NF90_INQ_VARID(NC_ID,'Longitude',Temp_ID))
          write(6,*) 'inquiring lon dimension'
          !Call Check_err(NF90_INQUIRE_DIMENSION(NC_ID,Temp_ID,&
          !               len=NY_temp))
          write(6,*) 'NX_temp = ',ny_temp
          write(6,*) 'NX = ',NX
          ALLOCATE( templon(NX) )
-         call Check_err(NF90_INQ_VARID(NC_ID,'lon',Temp_ID))
+         call Check_err(NF90_INQ_VARID(NC_ID,'Longitude',Temp_ID))
          !write(6,*) 'reading in templon'
          call Check_err(NF90_GET_VAR(NC_ID,Temp_ID,templon))
          write(6,*) 'templon: ',minval(templon)
@@ -446,11 +446,12 @@
       IF (FirstCall) THEN
          FirstCall = .FALSE.
          ! First call
-         call Check_err(NF90_INQ_DIMID(NC_ID,'lat',Temp_ID))
+         write(6,*) 'about to check dimide'
+         call Check_err(NF90_INQ_DIMID(NC_ID,'Latitude',Temp_ID))
          call Check_err(NF90_INQUIRE_DIMENSION(NC_ID,Temp_ID,len=NY))
-         call Check_err(NF90_INQ_DIMID(NC_ID,'lon',Temp_ID))
+         call Check_err(NF90_INQ_DIMID(NC_ID,'Longitude',Temp_ID))
          call Check_err(NF90_INQUIRE_DIMENSION(NC_ID,Temp_ID,len=NX))
-         call Check_err(NF90_INQ_DIMID(NC_ID,'depth',Temp_ID))
+         call Check_err(NF90_INQ_DIMID(NC_ID,'Depth',Temp_ID))
          call Check_err(NF90_INQUIRE_DIMENSION(NC_ID,Temp_ID,len=NZ))
           
          ! Allocate the lat lon and z arrays first 
@@ -472,11 +473,11 @@
          endif
 
          ! Read the latitude, longitude and z variables 
-         call Check_err(NF90_INQ_VARID(NC_ID,'lat',Temp_ID))
+         call Check_err(NF90_INQ_VARID(NC_ID,'Latitude',Temp_ID))
          call Check_err(NF90_GET_VAR(NC_ID,Temp_ID,BC3D_Lat))
-         call Check_err(NF90_INQ_VARID(NC_ID,'lon',Temp_ID))
+         call Check_err(NF90_INQ_VARID(NC_ID,'Longitude',Temp_ID))
          call Check_err(NF90_GET_VAR(NC_ID,Temp_ID,BC3D_Lon))
-         call Check_err(NF90_INQ_VARID(NC_ID,'depth',Temp_ID))
+         call Check_err(NF90_INQ_VARID(NC_ID,'Depth',Temp_ID))
          call Check_err(NF90_GET_VAR(NC_ID,Temp_ID,BC3D_Z, &
                         start=[1],count=[NZ]))
          IF (OutType.LT.3) THEN
@@ -537,17 +538,27 @@
       real(sz),allocatable :: Var(:,:,:)
 
       call Check_err(NF90_INQ_VARID(NC_ID,trim(varname),Temp_ID))
+      write(6,*) 'checked dimid'
       call Check_err(NF90_GET_ATT(NC_ID,Temp_ID,'_FillValue',FV))
-      call Check_err(NF90_GET_ATT(NC_ID,Temp_ID,'scale_factor',SF))
-      call Check_err(NF90_GET_ATT(NC_ID,Temp_ID,'add_offset',OS))
+      write(6,*) 'got fill val'
+      write(6,*) 'FV = ',FV
+      !call Check_err(NF90_GET_ATT(NC_ID,Temp_ID,'scale_factor',SF))
+      !write(6,*) 'got scale factor'
+      !call Check_err(NF90_GET_ATT(NC_ID,Temp_ID,'add_offset',OS))
+      !write(6,*) 'added offset'
       allocate(Var(NX,NY,NZ)) 
       call Check_err(NF90_GET_VAR(NC_ID,Temp_ID,Var))
+      write(6,*) 'read in ',trim(varname)
       ! Add on a little for buffer
-      FV = FV + 1d-3
+      !FV = FV - 1d-3
       do j = 1,NY
          do i = 1,NX
             do k = 1,NZ
-               if (Var(i,j,k) > FV) Var(i,j,k) = Var(i,j,k)*SF+OS
+               if (Var(i,j,k).NE.FV) then
+                  Var(i,j,k) = Var(i,j,k)!*SF+OS
+               else
+                  var(i,j,k) = -3d4
+               endif
             enddo
          enddo
       enddo
@@ -1117,7 +1128,7 @@
       REAL*8 :: RHO, RHOAVG, DZ
       REAL*8 :: SA(NZ), CT(NZ), LAT(NZ), N2(NZ-1), ZMID(NZ-1)!,&
                 !BCP_ADC(NZ,NP)
-      REAL(SZ) :: FV = -3D4, FVP = -3D4 + 1D-3, VS = 1D-3 
+      real(sz) :: FV = -3d4, FVP = -3d4 + 1d-3, Vs = 1d-3 
       ! persistent logical for if we are on the first call
       LOGICAL,SAVE :: FirstCall = .TRUE.
       ! looping variables for do loops
@@ -1135,6 +1146,8 @@
          FirstCall = .FALSE.
       ENDIF
       ALLOCATE( BCP_ADC(NZ,NP) )
+      WRITE(6,*) 'bc2d FV = ',FV
+      WRITE(6,*) 'bc2d FVP = ',FVP
       ! reset all values to 0
       BPG_ADCx  = 0d0
       BPG_ADCy  = 0d0
@@ -2918,7 +2931,7 @@
       CHARACTER(LEN=16),INTENT(IN) :: OGCMFILE
       INTEGER :: nsnaps, kk
       CHARACTER(len=16) :: tsnap ! dummy string b4 datetime conv
-      CHARACTER(LEN=40) :: file1,file2,file3
+      CHARACTER(LEN=60) :: file1,file2,file3
       OPEN(12,file=OGCMFILE,status='old')
       READ(12,*) nsnaps
       FN%NSNAPS=nsnaps
