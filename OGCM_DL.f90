@@ -282,8 +282,7 @@
             CALL GETOGCMFILE(1,CurDT,BC3D_Name)
             OKflag = .true.
             WRITE(6,*) 'BC3D_NAME = ',trim(BC3D_NAME)
-            BC3D_NAME = '/asclepius/cblakely/Datasets/HYCOM_data/'//&
-                        trim(BC3D_NAME)
+            BC3D_NAME = trim(BC3D_NAME)
             ! Read the OGCM NetCDF file
             call Read_BC3D_NetCDF(3)
             ! Calculate the steric adjustment.
@@ -309,8 +308,7 @@
                CALL GETOGCMFILE(ii,CurDT,BC3D_Name)
                OKflag = .true.
                WRITE(6,*) 'BC3D_NAME = ',trim(BC3D_NAME)
-               BC3D_NAME = '/asclepius/cblakely/Datasets/HYCOM_data/'//&
-                           trim(BC3D_NAME)
+               BC3D_NAME = trim(BC3D_NAME)
                ! Read the OGCM NetCDF file
                call Read_BC3D_NetCDF(ii + 2)
                ! Calculate the new BC2D terms.
@@ -1624,36 +1622,23 @@
          ! if applicable get the dynamic height anomaly
          IF (truebottom.GT.0) THEN
             DHA(:) = 0d0
-            !DHA(1:truebottom) = gsw_geo_strf_dyn_height(&
-            !                    SA(1:truebottom), CT(1:truebottom),&
-            !                    BC3D_Z(1:truebottom), &
-            !                    BC3D_Z(truebottom))
+            DHA(1:truebottom) = gsw_geo_strf_dyn_height(&
+                                SA(1:truebottom), CT(1:truebottom),&
+                                BC3D_Z(1:truebottom), &
+                                BC3D_Z(truebottom))
             DHA_avg = 0d0
-            DO iz = truebottom,1,-1
-               IF (iz.EQ.truebottom) THEN
-                  dha_step = RHO(iz)
+            DO iz = 1,truebottom
+               IF (iz.EQ.1) THEN
+                  dha_step = DHA(iz)
                   CYCLE
                ENDIF
-               dha_step = (1d0/2d0)*(dha_step + (RHO(iz)))
-               DZ = BC3D_Z(iz+1) - BC3D_Z(iz)
-               DHA_avg = DHA_avg + dha_step*DZ*g
-               DHA(iz) = DHA_avg
-               dha_step = RHO(iz)
-            ENDDO
-            DHA_avg = 0d0
-            DO iz = truebottom,1,-1
-               IF (iz.EQ.truebottom) THEN
-                  dha_step = DHA(iz)
-                  cycle
-               ENDIF
-               dha_step = (1d0/2d0)*(dha_step + DHA(iz))
-               DZ = BC3D_Z(iz+1) - BC3D_Z(iz)
+               dha_step = (1d0/2d0)*(dha_step + (DHA(iz)))
+               DZ = BC3D_Z(iz) - BC3D_Z(iz-1)
                DHA_avg = DHA_avg + dha_step*DZ
                dha_step = DHA(iz)
             ENDDO
             BCSL_adc(IP) = (DHA(1) - DHA_avg/BC3D_Z(truebottom))
-            BCSL_adc(IP) = BCSL_adc(IP)/(RhoWat0*g)
-            DHA_avg = DHA_avg/BC3D_Z(truebottom)
+            BCSL_adc(IP) = BCSL_adc(IP)/(g)
             IF (BCSL_adc(IP).GT.1d5) THEN
                BCSL_adc(IP) = 0
             ENDIF
